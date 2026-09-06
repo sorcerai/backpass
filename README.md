@@ -828,7 +828,9 @@ backpass \
 `--no-auto-agent` pins the pre-ladder defaults (codex / claude). Model and effort
 overrides are scoped to that Backpass invocation, so they never rewrite your harness
 defaults. If an adapter has no proven overlay, backpass stops rather than pretending it
-applied.
+applied. An effort of `none` skips the overlay for that pass entirely, which is what a
+model with no effort option needs (the Claude adapter's `haiku` rejects `set effort`);
+the role default applies otherwise.
 
 ### Configuration
 

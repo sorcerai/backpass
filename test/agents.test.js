@@ -1141,3 +1141,14 @@ test("acpx failure classification and the per-adapter tables", () => {
   assert.equal(effortOptionKey("pi"), null, "Pi effort is process --thinking, not ACP set");
   assert.equal(effortOptionKey("grok"), null);
 });
+
+test("an explicit effort of none skips the overlay for that role, so a model with no effort option still runs", async () => {
+  const { resolvedEffort } = await import("../src/agents.js");
+  const base = loadConfig(null, {}, { kind: "user" });
+  assert.equal(resolvedEffort("analysis", "claude", base), "medium", "the role default still applies when unset");
+  const none = loadConfig(null, { analysis: { effort: "none" } }, { kind: "user" });
+  assert.equal(resolvedEffort("analysis", "claude", none), null, "none means no invocation-scoped effort");
+  assert.equal(resolvedEffort("synthesis", "claude", none), "high", "the other role keeps its default");
+  const spaced = loadConfig(null, { synthesis: { effort: " NONE " } }, { kind: "user" });
+  assert.equal(resolvedEffort("synthesis", "claude", spaced), null, "case and whitespace do not matter");
+});

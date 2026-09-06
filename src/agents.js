@@ -530,10 +530,20 @@ export class AgentResolver {
   }
 }
 
-/** OpenCode variants are per-model, so role defaults do not become an overlay. */
+/**
+ * OpenCode variants are per-model, so role defaults do not become an overlay. An
+ * explicit `none` also means no overlay: some advertised models expose no effort option
+ * at all (the Claude adapter's `haiku` answers `set effort` with "Internal error"), and
+ * without an opt-out the role default would fail every call on such a model.
+ */
+export const NO_EFFORT = "none";
+
 export function resolvedEffort(role, agent, config) {
   const configured = config[role].effort;
-  if (typeof configured === "string" && configured.trim()) return configured.trim();
+  if (typeof configured === "string" && configured.trim()) {
+    const value = configured.trim();
+    return value.toLowerCase() === NO_EFFORT ? null : value;
+  }
   if (agent === "opencode") return null;
   return DEFAULT_EFFORT[role];
 }
