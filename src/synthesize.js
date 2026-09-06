@@ -3,17 +3,12 @@ import path from "node:path";
 
 import { extractJson, isBlankOutput, openSession, usageRecord } from "./acpx.js";
 import { expandHomePath, userClaudeSkillsDir } from "./config.js";
+import { alwaysLoadedSkillTokens } from "./plugin-skills.js";
 import { renderEvidenceForPrompt } from "./fold.js";
 import { renderInstructionIndex, resolveMemoryPath } from "./memory.js";
 import { renderPrompt, render, loadPrompt } from "./prompts.js";
 import { buildProposal, effectiveMaxEdits, ProposalViolation, renderChangesForPrompt } from "./proposal.js";
-import {
-  loadProjectSkills,
-  renderSkillIndex,
-  resolveOverflowTarget,
-  resolveProjectSkillDirs,
-  skillDescriptionTokens,
-} from "./skills.js";
+import { loadProjectSkills, renderSkillIndex, resolveOverflowTarget, resolveProjectSkillDirs } from "./skills.js";
 import { isSuppressedByRejection } from "./state.js";
 import { SURFACE_TARGET } from "./target.js";
 import { emitProgress } from "./progress.js";
@@ -268,7 +263,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
   const searchPathRoots = (config.skillSearchPaths || []).map((p) => expandHomePath(p));
   // The budget is the whole always-loaded surface whatever the target: a skill target
   // moves it by that skill's description-line delta, nothing else changes.
-  const descriptionTokens = skillDescriptionTokens(skillFiles);
+  const descriptionTokens = alwaysLoadedSkillTokens(skillFiles, { userScope, repoRoot: repo.root });
   const maxEdits = effectiveMaxEdits(memoryFile, config, descriptionTokens);
   const target = config.target || SURFACE_TARGET;
 

@@ -2,17 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { userClaudeSkillsDir } from "../config.js";
-import { color, json, out } from "../logger.js";
+import { color, json, out, warn } from "../logger.js";
 import { resolveMemoryFiles } from "../memory.js";
 import { nestedBudget, nestedReachWarning, readNestedReach, resolveNestedMemoryFiles } from "../nested.js";
-import {
-  loadProjectSkills,
-  resolveOverflowTarget,
-  resolveProjectSkillDirs,
-  skillDescriptionTokens,
-} from "../skills.js";
+import { loadProjectSkills, resolveOverflowTarget, resolveProjectSkillDirs } from "../skills.js";
 import { crossSurfaceDuplicates } from "../overlap.js";
 import { HostCache, pruneHostCache } from "../discovery/cache.js";
+import { alwaysLoadedSkillTokens, pluginSkillLayer } from "../plugin-skills.js";
 import { budgetBar, budgetStatus, formatTokens } from "../tokens.js";
 import { table } from "./scan.js";
 import { candidateKey, isProbeEntryFresh, resolvedEffort } from "../agents.js";
@@ -40,7 +36,11 @@ export async function cmdStatus(ctx) {
   });
   const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
   const skills = loadProjectSkills(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
-  const descriptionTokens = skillDescriptionTokens(skills);
+  const descriptionTokens = alwaysLoadedSkillTokens(skills, { userScope, repoRoot: repo.root });
+  // Split for display only: the overflow line must name what this repo's own skills cost,
+  // never the read-only plugin layer folded into the same gated total.
+  const pluginLayer = userScope ? pluginSkillLayer(repo.root) : { tokens: 0, skills: [], warnings: [] };
+  const ownDescriptionTokens = descriptionTokens - pluginLayer.tokens;
 
   const duplicates = files
     .filter((file) => !resolved.pointers.includes(file))
@@ -143,10 +143,20 @@ export async function cmdStatus(ctx) {
     out(
       color.dim(
         `  overflow: ${skills.length} skill(s) in ${skillDirs.join(", ")} · ${formatTokens(skillTokens)} tok on trigger, ` +
-          `${formatTokens(descriptionTokens)} tok always loaded`,
+          `${formatTokens(ownDescriptionTokens)} tok always loaded`,
       ),
     );
   }
+  if (pluginLayer.skills.length) {
+    const plugins = new Set(pluginLayer.skills.map((s) => s.plugin)).size;
+    out(
+      color.dim(
+        `  plugins: ${pluginLayer.skills.length} skill(s) from ${plugins} enabled plugin(s) · ` +
+          `${formatTokens(pluginLayer.tokens)} tok always loaded, read-only`,
+      ),
+    );
+  }
+  for (const w of pluginLayer.warnings) warn(w);
   if (nestedAttribution?.files.length) {
     out("");
     const when = nestedAttribution.measuredAt

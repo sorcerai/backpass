@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { applyEdit, filesOfEdit, sliceEditForFile } from "../proposal.js";
 import { memoryTextHash, readOnlyResolvedPath, resolveMemoryPath } from "../memory.js";
 import { userClaudeSkillsDir } from "../config.js";
+import { alwaysLoadedSkillTokens } from "../plugin-skills.js";
 import { budgetGateKind, budgetStatus, estimateTokens, formatTokens } from "../tokens.js";
 import { recordRejection } from "../state.js";
 import { nestedBudget } from "../nested.js";
@@ -19,7 +20,6 @@ import {
   parseFrontmatter,
   removeOwnedSkillPaths,
   resolveOverflowTarget,
-  skillDescriptionTokens,
   writeSkill,
 } from "../skills.js";
 
@@ -362,7 +362,7 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
   ).dir;
   const configuredSkillDirs = proposal.config?.skillsDirs || proposal.config?.skillDirs || config.skillsDirs || [];
   const skillsNow = loadProjectSkills(repo.root, skillsDir, configuredSkillDirs, { exact: userScope });
-  const descriptionTokensNow = skillDescriptionTokens(skillsNow);
+  const descriptionTokensNow = alwaysLoadedSkillTokens(skillsNow, { userScope, repoRoot: repo.root });
 
   // Freshness for every non-memory file a decision targets, the same contract the
   // memory file gets: each hunk was cut from one exact image, and a file that changed

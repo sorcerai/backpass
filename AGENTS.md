@@ -68,6 +68,10 @@ Each owning file's comments and tests hold the detail; read them before touching
   A harness loads what a path resolves to, so a symlinked directory under the loaded dir is a skill:
   entry types are stat'd (`isDirectoryEntry`), fail-soft, and a broken or cyclic link reads as absent.
   One library reached through k links is k loaded entries, billed k times.
+- **Enabled plugin skills are counted, never edited** (`src/plugin-skills.js`): user scope only, their
+  `description:` lines join the always-loaded budget through `alwaysLoadedSkillTokens`, the single helper every
+  budget site calls (keep `skillDescriptionTokens` internal). Keep them out of `loadProjectSkills`, staging,
+  `resolveTarget`, analysis and synthesis; reads are fail-soft.
 - **Memory resolution is pointer-aware** (`resolveMemoryFiles` in `src/memory.js`); a second full file is warned
   about, never silently ignored or double-written.
 - **Spawns**: a Windows shim refusal (`ERR_WINDOWS_SHIM_UNSAFE_ARG`, `src/subprocess.js`) must be raised by name

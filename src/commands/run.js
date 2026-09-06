@@ -4,7 +4,7 @@ import { runAnalysis } from "./analyze.js";
 import { bootstrapJson, bootstrapRun, printBootstrap } from "./bootstrap.js";
 import { printProposal, printSynthesisFailure, runProposal, synthesisFailureHint } from "./propose.js";
 import { budgetBar, formatTokens } from "../tokens.js";
-import { skillDescriptionTokens } from "../skills.js";
+import { alwaysLoadedSkillTokens } from "../plugin-skills.js";
 import { startTui } from "../tui/index.js";
 import { resolveMemoryFiles } from "../memory.js";
 import { nestedBudget } from "../nested.js";
@@ -76,7 +76,10 @@ export async function cmdRun(ctx) {
 
     // The banner shows what the gate measures: the always-loaded surface, which is the
     // memory file plus every skill description line.
-    const descriptionTokens = skillDescriptionTokens(analysis.skills || []);
+    const descriptionTokens = alwaysLoadedSkillTokens(analysis.skills || [], {
+      userScope: scope?.kind === "user",
+      repoRoot: repo.root,
+    });
     const alwaysLoaded = analysis.file.tokens + descriptionTokens;
     const budget = budgetBar({
       utilization: alwaysLoaded / config.budgetTokens,

@@ -14,7 +14,8 @@ import {
   writeNestedReach,
 } from "../nested.js";
 import { transcriptIdentity } from "../transcript.js";
-import { loadProjectSkills, resolveOverflowTarget, skillDescriptionTokens } from "../skills.js";
+import { loadProjectSkills, resolveOverflowTarget } from "../skills.js";
+import { alwaysLoadedSkillTokens } from "../plugin-skills.js";
 import { emitProgress } from "../progress.js";
 import { closeRemoteDiscovery, discoverForRun } from "./scan.js";
 import { printUsage } from "./usage.js";
@@ -95,7 +96,10 @@ async function runAnalysisCore(ctx) {
   const { repo, scope, config } = ctx;
   const { file, hash, skills, nested: weights } = primaryMemoryFile(repo, config, scope);
   // Deterministic by design: tokens and units come from parsing the file, no model.
-  const descriptionTokens = skillDescriptionTokens(skills);
+  const descriptionTokens = alwaysLoadedSkillTokens(skills, {
+    userScope: scope?.kind === "user",
+    repoRoot: repo.root,
+  });
   emitProgress("memory", {
     path: file.path,
     label: skills.length ? `${file.path} + skill descriptions` : file.path,

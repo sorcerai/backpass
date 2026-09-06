@@ -557,6 +557,14 @@ description line costs that many times its delta. (A repo that already carries m
 may find itself over budget with no file having changed when upgrading to this accounting - that is the
 one-time re-tune of `budgetTokens`, not a regression.)
 
+In **user scope** the gated number also includes every enabled Claude Code plugin's skill
+descriptions. Those load on every turn just like your own, so leaving them out would
+understate the surface the run is tuned against. They are counted and never edited: the
+files belong to the plugin and the next update overwrites them, so backpass never proposes
+a change to one and never shows them to the model. Disabling a plugin you do not use is
+the way to reclaim those tokens. A project-scoped run ignores this layer, because those
+tokens are user-level and a repo cannot trade them away.
+
 ```
 AGENTS.md      [###############.................] 2,412 / 5,000 tok · 63 instructions
 ```

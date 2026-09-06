@@ -4,7 +4,8 @@ import { renderHunkLines } from "./diff.js";
 import { normalizeSourceLabel } from "./gap-ledger.js";
 import { mixFromCounts } from "./interaction.js";
 import { memoryTextHash } from "./memory.js";
-import { editSkills, loadedCopies, parseFrontmatter, skillDescriptionTokens } from "./skills.js";
+import { editSkills, loadedCopies, parseFrontmatter } from "./skills.js";
+import { alwaysLoadedSkillTokens } from "./plugin-skills.js";
 import { budgetGateKind, budgetStatus, estimateTokens } from "./tokens.js";
 import { rootOwnsGap } from "./nested.js";
 import { isSkillFilePath, normalizeRecoveryLine, recoveredLineCounts } from "./workspace.js";
@@ -393,7 +394,10 @@ export function buildProposal(rawResult, context) {
 
   // Skill description lines are always loaded, so they sit under the same cap as the
   // memory file: one always-loaded budget, per the captain's ruling.
-  const descriptionTokensNow = skillDescriptionTokens(skillFiles);
+  const descriptionTokensNow = alwaysLoadedSkillTokens(skillFiles, {
+    userScope: scope?.kind === "user",
+    repoRoot: repo?.root,
+  });
   const maxEdits = effectiveMaxEdits(memoryFile, config, descriptionTokensNow);
   if (edits.length > maxEdits) {
     violations.push(`proposed ${edits.length} edits but the per-run cap is ${maxEdits} (the learning rate)`);
