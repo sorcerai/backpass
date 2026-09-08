@@ -107,6 +107,24 @@ test("redaction runs on tool input and output inside the trace", () => {
   assert.ok(!trace.includes("ghp_abcdefghijklmnopqrstuvwxyz0123"));
 });
 
+test("provider-prefixed keys are redacted across messages, tool input, and tool results", () => {
+  const token = "sk-tinyfish-7k2m9x4q8w1e5r3t";
+  const { trace } = distill(
+    [
+      { kind: "message", role: "user", text: `search the catalog again with ${token}` },
+      {
+        kind: "tool",
+        name: "Bash",
+        input: { command: `curl -H "X-API-Key: ${token}" https://api.example.com` },
+        result: `401 unauthorized for ${token}`,
+      },
+    ],
+    META,
+  );
+  assert.ok(!trace.includes(token), "the raw token must not reach the trace");
+  assert.match(trace, /\[redacted:TINYFISH_KEY\]/);
+});
+
 test("evidence items without a verbatim quote are discarded at parse time", () => {
   const clean = sanitizeEvidence({
     positive: [
