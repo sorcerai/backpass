@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { execOneShot, extractJson, sessionPrompt, usageRecord } from "./acpx.js";
+import { extractJson, runModelCall, usageRecord } from "./acpx.js";
 import { distill } from "./distill.js";
 import { classifyInteraction } from "./interaction.js";
 import { readTranscript } from "./discovery/index.js";
@@ -40,13 +40,43 @@ function noteOnce(note) {
 /** Negative evidence carries one of these classes; anything else is dropped as unjudged. */
 export const NEGATIVE_CLASSES = ["harm", "non-compliance", "irrelevant"];
 
-/** Evidence items without a verbatim quote are dropped - the rubric's central rule. */
-export function sanitizeEvidence(parsed, memoryFile = null) {
-  const clean = { positive: [], negative: [], gaps: [], usedRawTranscript: Boolean(parsed?.usedRawTranscript) };
+/** Whitespace-insensitive form used to check a quote against the trace it claims to come from. */
+function foldSpace(text) {
+  return String(text).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Evidence items without a verbatim quote are dropped - the rubric's central rule.
+ *
+ * When `trace` is supplied and the model did not open the raw transcript, a quote must
+ * also appear in that trace (whitespace folded). A quote that is long enough but not in
+ * the trace is a paraphrase, and a paraphrase is a claim without evidence. When the model
+ * reports `usedRawTranscript`, the quote may come from text the distiller truncated or
+ * elided, so the substring check is skipped rather than punishing the honest path. Only
+ * the literal boolean opts out: a model that answers `"false"` must still anchor its
+ * quotes, or a stringly-typed reply would disable the check it is meant to fail.
+ *
+ * `quotesNotInTrace` counts what the trace check rejected, so a run whose analysis model
+ * paraphrases everything reads as that rather than as a clean repo.
+ */
+export function sanitizeEvidence(parsed, memoryFile = null, trace = null) {
+  const clean = {
+    positive: [],
+    negative: [],
+    gaps: [],
+    usedRawTranscript: parsed?.usedRawTranscript === true,
+    quotesNotInTrace: 0,
+  };
   if (!parsed || typeof parsed !== "object") return clean;
 
   const validInstructions = memoryFile ? new Set(instructionUnits(memoryFile).map((unit) => unit.id)) : null;
-  const hasQuote = (item) => typeof item?.quote === "string" && item.quote.trim().length >= 8;
+  const foldedTrace = typeof trace === "string" && !clean.usedRawTranscript ? foldSpace(trace) : null;
+  const hasQuote = (item) => {
+    if (typeof item?.quote !== "string" || item.quote.trim().length < 8) return false;
+    if (foldedTrace === null || foldedTrace.includes(foldSpace(item.quote))) return true;
+    clean.quotesNotInTrace += 1;
+    return false;
+  };
 
   for (const key of ["positive", "negative"]) {
     for (const item of Array.isArray(parsed[key]) ? parsed[key] : []) {
@@ -120,6 +150,7 @@ async function analyzeOne({
   slot = 0,
   openGapIndex = "(none yet)",
   skillIndex = "(this repo has no skills)",
+  alsoLoaded = "",
 }) {
   const raw = await readTranscript(transcript);
   const distilled = distill(raw.events, {
@@ -156,6 +187,7 @@ async function analyzeOne({
   const prompt = renderPrompt("analysis", {
     MEMORY_PATH: memoryFile.path,
     INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
+    ALSO_LOADED: alsoLoaded,
     SKILLS: skillIndex,
     OPEN_GAPS: openGapIndex,
     TRACE: distilled.trace,
@@ -178,12 +210,8 @@ async function analyzeOne({
     };
     // Route effortful calls through a fresh per-transcript session so each harness's
     // invocation-scoped overlay or safe fallback is applied; otherwise one-shot is cheaper.
-    if (!pick.effort) return execOneShot(call);
-    callCounter += 1;
-    return sessionPrompt({
-      ...call,
-      effort: pick.effort,
-      sessionName: `backpass-analysis-${process.pid}-${slot}-${callCounter}`,
+    return runModelCall(call, pick, {
+      sessionName: () => `backpass-analysis-${process.pid}-${slot}-${++callCounter}`,
     });
   });
   for (const note of result.notes || []) noteOnce(note);
@@ -195,7 +223,7 @@ async function analyzeOne({
 
   return {
     status: "ok",
-    evidence: sanitizeEvidence(parsed, memoryFile),
+    evidence: sanitizeEvidence(parsed, memoryFile, distilled.trace),
     usage: usageRecord(ranWith, result),
     distilled,
   };
@@ -230,6 +258,8 @@ export async function analyzeTranscripts({
   modelCwd = null,
   memoryHash,
   force = false,
+  prefetch = null,
+  alsoLoaded = "",
 }) {
   const state = config.state;
   const pending = [];
@@ -241,6 +271,7 @@ export async function analyzeTranscripts({
     failed: 0,
     usage: [],
     staleMemoryHash: 0,
+    quotesNotInTrace: 0,
   };
   const priorHashes = new Set();
   const transcriptMetadata = (transcript) => ({
@@ -256,6 +287,7 @@ export async function analyzeTranscripts({
     cwd: transcript.cwd || null,
     project: transcript.project || null,
     projectRoot: transcript.projectRoot || null,
+    host: transcript.host || null,
   });
 
   for (const transcript of transcripts) {
@@ -284,6 +316,11 @@ export async function analyzeTranscripts({
         `missing, and reuse resumes once this pass re-judges it against the current memory file and skill descriptions`,
     );
   }
+
+  // Remote sessions have no content here yet. Fetch exactly the pending ones, before the
+  // pool, so a cached or skipped transcript never costs an ssh call - and so an
+  // unreachable host fails one transcript at a time rather than mid-fan-out.
+  if (prefetch) await prefetch(pending);
 
   if (!pending.length) {
     emitProgress("analyze:start", { pending: 0, cached: summary.cached, total: transcripts.length, jobs: config.jobs });
@@ -350,6 +387,7 @@ export async function analyzeTranscripts({
         slot,
         openGapIndex,
         skillIndex,
+        alsoLoaded,
       });
       if (result.status === "skipped") {
         summary.skipped += 1;
@@ -366,6 +404,7 @@ export async function analyzeTranscripts({
         evidenceTotals.positive += result.evidence.positive.length;
         evidenceTotals.negative += result.evidence.negative.length;
         evidenceTotals.gaps += result.evidence.gaps.length;
+        summary.quotesNotInTrace += result.evidence.quotesNotInTrace;
         emitProgress("analyze:evidence", { ...evidenceTotals });
       }
     } catch (err) {
@@ -388,6 +427,14 @@ export async function analyzeTranscripts({
       }
     }
   });
+
+  if (summary.quotesNotInTrace) {
+    warn(
+      `${summary.quotesNotInTrace} quote(s) were discarded because they do not appear in the ` +
+        `distilled trace they claim to come from; a model that paraphrases instead of copying ` +
+        `produces fewer findings, not cleaner ones - consider a stronger analysis model`,
+    );
+  }
 
   emitProgress("analyze:done", summary);
   return summary;
