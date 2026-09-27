@@ -185,14 +185,15 @@ function setup(
     : "AGENTS.md";
   if (externalMemory) fs.writeFileSync(memoryPath, text);
   const memoryFile = readMemoryFile(repo.root, memoryPath, { allowExternal: externalMemory });
-  const run = () =>
+  const run = ({ memoryFile: selectedFile = memoryFile, config: selectedConfig = config, routing = null } = {}) =>
     synthesizeProposal({
-      memoryFile,
+      memoryFile: selectedFile,
       summary,
-      config,
+      config: selectedConfig,
       repo,
       transcripts: [{ harness: "claude" }],
       scope,
+      routing,
     });
   const calls = () =>
     fs
@@ -203,6 +204,46 @@ function setup(
       .map((l) => JSON.parse(l));
   return { repo, config, memoryFile, externalSkillsDir, run, calls };
 }
+
+test("root and nested synthesis both refuse direct writes to the other memory file", async () => {
+  for (const pass of ["root", "nested"]) {
+    const { repo, config, run } = setup(
+      { edit: {}, annotations: [{ reply: { edits: [] } }] },
+      { overrides: { nestedMemoryFiles: ["apps/api/AGENTS.md"] } },
+    );
+    const nestedPath = "apps/api/AGENTS.md";
+    const nestedText = "# API memory\n";
+    const absoluteNested = path.join(repo.root, nestedPath);
+    fs.mkdirSync(path.dirname(absoluteNested), { recursive: true });
+    fs.writeFileSync(absoluteNested, nestedText);
+    const target = pass === "root" ? absoluteNested : path.join(repo.root, "AGENTS.md");
+    fs.writeFileSync(
+      path.join(repo.root, "fake-script.json"),
+      JSON.stringify({ edit: { [target]: "# Direct write\n" }, annotations: [{ reply: { edits: [] } }] }),
+    );
+    const nestedConfig = {
+      ...config,
+      memoryFiles: [nestedPath],
+      target: { kind: "memory", path: nestedPath, nested: true },
+    };
+    await assert.rejects(
+      () =>
+        pass === "root"
+          ? run()
+          : run({
+              memoryFile: readMemoryFile(repo.root, nestedPath),
+              config: nestedConfig,
+              routing: { rootPath: "AGENTS.md" },
+            }),
+      (err) =>
+        err instanceof UserError &&
+        err.message.includes(
+          `synthesis changed ${pass === "root" ? nestedPath : "AGENTS.md"} in the repository directly`,
+        ),
+    );
+    assert.equal(fs.readFileSync(target, "utf8"), "# Direct write\n");
+  }
+});
 
 test("synthesis edits the staging copy natively; measured hunks anchor to the raw file and nothing touches the repo until apply", async () => {
   const { repo, config, run, calls } = setup({
@@ -735,6 +776,34 @@ test("a staged skill that resolves outside the repository is reported as such, n
     );
     assert.doesNotMatch(err.message, /in the repository directly/);
     assert.match(err.hint, /another process changed the shared library mid-run/);
+    return true;
+  });
+});
+
+test("a skill reached only through skillSearchPaths is never staged, and a direct write to it is still caught by the fingerprint", async () => {
+  const shared = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "backpass-search-path-")));
+  fs.mkdirSync(path.join(shared, "db"));
+  fs.writeFileSync(path.join(shared, "db", "SKILL.md"), DB_SKILL);
+
+  // Unlike an ordinary withheld skill, a `skillSearchPaths` root carries a promise that
+  // must be enforceable: a direct write to it has to fail the run loudly, never be
+  // excused the way a skill staging withheld for other reasons is.
+  const searched = setup({ edit: {} }, { overrides: { skillSearchPaths: [shared] } });
+  const skillPath = path.join(shared, "db", "SKILL.md");
+  fs.writeFileSync(
+    process.env.FAKE_ACPX_SCRIPT,
+    JSON.stringify({
+      edit: { [skillPath]: { replace: [["Keep transactions short.", "Keep every transaction short."]] } },
+      annotations: [{ reply: { edits: [] } }],
+    }),
+  );
+
+  await assert.rejects(searched.run(), (err) => {
+    assert.ok(err instanceof UserError);
+    assert.ok(
+      err.message.includes(`${skillPath} changed during synthesis; that path resolves outside the repository`),
+      err.message,
+    );
     return true;
   });
 });
