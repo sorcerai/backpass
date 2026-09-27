@@ -46,7 +46,25 @@ export const LEGACY_DEFAULT_AGENTS = { analysis: "codex", synthesis: "claude" };
 export const DEFAULT_CONFIG = {
   memoryFiles: ["AGENTS.md", "CLAUDE.md"],
   budgetTokens: 5000,
+  /**
+   * Nested memory files a surface run also trains, each as its own weight: a
+   * repo-relative path like `apps/api/AGENTS.md`, fed only by the sessions that worked
+   * under its directory (`src/nested.js`). Only files named here are ever trained;
+   * nothing is discovered. Project scope only.
+   */
+  nestedMemoryFiles: [],
+  /** Always-loaded budget per nested memory file; `null` means `budgetTokens`. */
+  nestedBudgetTokens: null,
   skillsDir: ".agents/skills",
+  /**
+   * Extra directories to consult for *existing* skills, alongside `skillsDir`, when
+   * deciding whether an AGENTS.md pointer already resolves, whether a failed trigger
+   * needs a description edit instead of duplicate content, and whether an extraction
+   * should point at a shared skill rather than create a new one. `~` is expanded. These
+   * are read-only awareness: writes always target only `skillsDir`, never a search path
+   * (a skill resolving outside the repo is withheld from the synthesis staging copy).
+   */
+  skillSearchPaths: [],
   /** `null` means adaptive: see `effectiveMaxEdits` in proposal.js. An integer pins it. */
   maxEditsPerRun: null,
   minGapEvidence: 2,
@@ -84,6 +102,14 @@ export const DEFAULT_CONFIG = {
      * checkout or a parent of checkouts. Discovery only reads git identity there.
      */
     cloneRoots: [],
+    /**
+     * SSH destinations whose harness stores this run also collects from
+     * (`src/discovery/hosts.js`). Personal configuration only: a repository file that
+     * sets it is refused by name, so a checked-in config can never point a
+     * contributor's backpass at a machine. Entries are an ssh destination string, or
+     * `{ host, node, env, harnesses, connectTimeoutSeconds }`.
+     */
+    hosts: [],
     minUserTurns: 2,
     includeCursorIde: false,
   },
@@ -133,6 +159,87 @@ export const USER_CONFIG_DEFAULTS = {
     maxTranscriptsPerProject: null,
   },
 };
+
+/** True for a filesystem root spelling: `/`, repeated separators, or a Windows volume root. */
+function isFilesystemRoot(p) {
+  const s = p.trim();
+  if (/^\/+$/.test(s) || /^\\+$/.test(s)) return true;
+  if (/^[A-Za-z]:[/\\]*$/.test(s)) return true;
+  return false;
+}
+
+/** True when `candidate` is `root`, or lies inside it. Both must already be resolved. */
+export function isAncestorOrEqual(root, candidate) {
+  return root === candidate || candidate.startsWith(`${root}${path.sep}`);
+}
+
+/** Expand a leading `~` to the home directory; other paths pass through unchanged. */
+export function expandHomePath(p, home = os.homedir()) {
+  if (typeof p !== "string") return p;
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return path.join(home, p.slice(2));
+  return p;
+}
+
+/**
+ * Canonical identities of the configured `skillSearchPaths` roots, resolved EXACTLY the
+ * way a skill source is (`prepareWorkspace` builds a source with `path.join(repo.root, ...)`
+ * then compares `fs.realpathSync` identities): expand `~`, resolve a relative entry
+ * against the repository root - never the process working directory - then follow links.
+ * Building it any other way is how the read-only promise fails open: `fs.realpathSync` on a
+ * raw relative value resolves against `process.cwd()`, so it never matches the real source
+ * and the refusal never fires.
+ *
+ * Fail CLOSED: a configured root that exists but cannot be canonicalised raises a clear
+ * error naming `config.skillSearchPaths` rather than being dropped - silently discarding it
+ * would delete the promise instead of enforcing it. A not-yet-existing root (`ENOENT`)
+ * keeps its resolved absolute path as its identity: nothing can load from, or be written
+ * to, a directory that does not exist, so the promise stays whole either way.
+ *
+ * A root that is the repository itself, an ancestor of it (e.g. "~" with the repo checked
+ * out under $HOME), or that equals or contains the repo's own configured `skillsDir` (e.g.
+ * ".agents" covering ".agents/skills") is dropped rather than registered: `validate()`
+ * below rejects that shape at load time, but this function is also reachable directly
+ * (tests, future callers), and such a root would otherwise mark files backpass exists to
+ * write as "inside a search path" - the repo's own containment must win for its own files.
+ */
+export function canonicalizeSearchPathRoots(repoRoot, roots = [], skillsDir = null, home = os.homedir()) {
+  // Reference points (the repo root and its skillsDir) resolve leniently: any resolution
+  // failure falls back to the plain absolute path rather than aborting, since a not-yet-
+  // created skillsDir must still win its own containment check.
+  const resolveReference = (candidate) => {
+    const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(repoRoot, candidate);
+    try {
+      return fs.realpathSync(absolute);
+    } catch {
+      return absolute;
+    }
+  };
+  const identities = new Set();
+  const repoIdentity = resolveReference(repoRoot);
+  const skillsIdentity = skillsDir ? resolveReference(skillsDir) : null;
+  for (const raw of roots) {
+    const expanded = expandHomePath(raw, home);
+    const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(repoRoot, expanded);
+    let identity;
+    try {
+      identity = fs.realpathSync(absolute);
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        identity = absolute;
+      } else {
+        throw new UserError(
+          `config.skillSearchPaths root "${raw}" cannot be resolved (${err.message})`,
+          "point it at a readable directory, or remove it from skillSearchPaths",
+        );
+      }
+    }
+    if (isAncestorOrEqual(identity, repoIdentity)) continue;
+    if (skillsIdentity && isAncestorOrEqual(identity, skillsIdentity)) continue;
+    identities.add(identity);
+  }
+  return identities;
+}
 
 export function parseScopeKind(value) {
   if (value === undefined || value === null || value === "") return "project";
@@ -214,12 +321,30 @@ export function sinceCutoff(since, now = Date.now()) {
   return window === null ? null : now - window;
 }
 
-function validate(config, { kind = "project" } = {}) {
+function validate(config, { kind = "project", repoRoot = null } = {}) {
   if (!Array.isArray(config.memoryFiles) || config.memoryFiles.length === 0) {
     throw new UserError("config.memoryFiles must be a non-empty array");
   }
   if (!Number.isFinite(config.budgetTokens) || config.budgetTokens <= 0) {
     throw new UserError("config.budgetTokens must be a positive number");
+  }
+  if (
+    !Array.isArray(config.nestedMemoryFiles) ||
+    config.nestedMemoryFiles.some((entry) => typeof entry !== "string" || !entry.trim())
+  ) {
+    throw new UserError("config.nestedMemoryFiles must be an array of repo-relative paths");
+  }
+  if (kind === "user" && config.nestedMemoryFiles.length) {
+    throw new UserError(
+      "config.nestedMemoryFiles is project-scope only",
+      "list nested memory files in the repository's .backpassrc.json",
+    );
+  }
+  if (
+    config.nestedBudgetTokens !== null &&
+    (!Number.isFinite(config.nestedBudgetTokens) || config.nestedBudgetTokens <= 0)
+  ) {
+    throw new UserError("config.nestedBudgetTokens must be a positive number, or null to use budgetTokens");
   }
   if (config.maxEditsPerRun !== null && (!Number.isInteger(config.maxEditsPerRun) || config.maxEditsPerRun <= 0)) {
     throw new UserError("config.maxEditsPerRun must be a positive integer, or null for the adaptive cap");
@@ -237,6 +362,37 @@ function validate(config, { kind = "project" } = {}) {
   if (config.skillsDirs !== undefined) {
     if (!Array.isArray(config.skillsDirs) || config.skillsDirs.some((d) => typeof d !== "string")) {
       throw new UserError("config.skillsDirs must be an array of paths");
+    }
+  }
+  if (config.skillSearchPaths !== undefined) {
+    if (!Array.isArray(config.skillSearchPaths) || config.skillSearchPaths.some((d) => typeof d !== "string")) {
+      throw new UserError("config.skillSearchPaths must be an array of paths");
+    }
+    for (const entry of config.skillSearchPaths) {
+      if (!entry.trim()) {
+        throw new UserError("config.skillSearchPaths entries must be non-empty path strings");
+      }
+      // The filesystem root as a search path would mark every path read-only and leave
+      // nothing stageable - a degenerate value that must be rejected, not enforced.
+      if (isFilesystemRoot(entry)) {
+        throw new UserError(
+          `config.skillSearchPaths entry "${entry}" must not be the filesystem root`,
+          "name a specific shared skills directory",
+        );
+      }
+      // A root that is the repo itself, an ancestor of it (e.g. "~" with the repo checked
+      // out under $HOME), or that equals or contains the repo's own configured skillsDir
+      // (e.g. ".agents" covering ".agents/skills") would mark files backpass exists to
+      // write as "inside a search path" too - the same degenerate shape as the
+      // filesystem-root case above. `canonicalizeSearchPathRoots` is the one place that
+      // decides this, both here (reject at load) and at runtime (drop for direct callers) -
+      // never duplicate the comparison.
+      if (repoRoot && canonicalizeSearchPathRoots(repoRoot, [entry], config.skillsDir).size === 0) {
+        throw new UserError(
+          `config.skillSearchPaths entry "${entry}" must not be the repository root or its skillsDir, or an ancestor of either`,
+          "name a shared skills directory outside the repository",
+        );
+      }
     }
   }
   const includeProjects = config.discovery.includeProjects;
@@ -305,7 +461,26 @@ function validate(config, { kind = "project" } = {}) {
   if (!Array.isArray(config.discovery.cloneRoots) || config.discovery.cloneRoots.some((p) => typeof p !== "string")) {
     throw new UserError("config.discovery.cloneRoots must be an array of paths");
   }
+  if (config.discovery.hosts !== undefined && !Array.isArray(config.discovery.hosts)) {
+    throw new UserError("config.discovery.hosts must be an array of ssh destinations");
+  }
   return config;
+}
+
+/**
+ * A repository may not name a machine.
+ *
+ * `.backpassrc.json` is checked in and shared, so a `discovery.hosts` there would let one
+ * contributor point every other contributor's backpass at a host - which is exactly the
+ * "someone else's transcripts" the vision resists. Hosts are personal configuration and
+ * live in the person's own global file, or on the command line for one run.
+ */
+function refuseRepoHosts(repoFile, file) {
+  if (!repoFile?.discovery || repoFile.discovery.hosts === undefined) return;
+  throw new UserError(
+    `${file} sets discovery.hosts, but ssh hosts are personal configuration`,
+    `move them to ${userConfigPath()}, or pass --host <destination> for one run`,
+  );
 }
 
 /**
@@ -315,6 +490,10 @@ function validate(config, { kind = "project" } = {}) {
  *   <repo>/.backpassrc.json < CLI flags.
  * User: defaults < user-scope defaults < ~/.config/backpass/config.json `user` block <
  *   CLI flags. `.backpassrc.json` is never read.
+ *
+ * `discovery.hosts` is the one setting a repository file may not carry at all
+ * (`refuseRepoHosts`). In user scope it defaults to the global file's top-level list, so
+ * a person names their machines once rather than once per scope.
  */
 export function loadConfig(repoRoot, overrides = {}, { kind = "project" } = {}) {
   const scopeKind = parseScopeKind(kind);
@@ -327,15 +506,19 @@ export function loadConfig(repoRoot, overrides = {}, { kind = "project" } = {}) 
       (acc, layer) => (layer ? deepMerge(acc, layer) : acc),
       {},
     );
+    if (userBlock.discovery?.hosts === undefined && overrides.discovery?.hosts === undefined) {
+      merged.discovery.hosts = globalFile?.discovery?.hosts ?? DEFAULT_CONFIG.discovery.hosts;
+    }
   } else {
     const globalFile = readJsonIfPresent(userConfigPath());
     const projectGlobal = globalFile ? { ...globalFile } : null;
     if (projectGlobal) delete projectGlobal.user;
-    merged = [
-      projectGlobal,
-      repoRoot ? readJsonIfPresent(path.join(repoRoot, CONFIG_FILENAME)) : null,
-      overrides,
-    ].reduce((acc, layer) => (layer ? deepMerge(acc, layer) : acc), DEFAULT_CONFIG);
+    const repoFile = repoRoot ? readJsonIfPresent(path.join(repoRoot, CONFIG_FILENAME)) : null;
+    refuseRepoHosts(repoFile, repoRoot ? path.join(repoRoot, CONFIG_FILENAME) : CONFIG_FILENAME);
+    merged = [projectGlobal, repoFile, overrides].reduce(
+      (acc, layer) => (layer ? deepMerge(acc, layer) : acc),
+      DEFAULT_CONFIG,
+    );
   }
 
   const config = structuredClone(merged);
@@ -343,7 +526,30 @@ export function loadConfig(repoRoot, overrides = {}, { kind = "project" } = {}) 
   if (config.discovery.includeCursorIde && !config.discovery.harnesses.includes("cursor-ide")) {
     config.discovery.harnesses = [...config.discovery.harnesses, "cursor-ide"];
   }
-  return validate(config, { kind: scopeKind });
+  const validated = validate(config, { kind: scopeKind, repoRoot });
+  // `skillSearchPaths` is the read-side awareness key. It rides the existing `skillsDirs`
+  // awareness list (consulted after `skillsDir` in list order) rather than a second plumbing;
+  // `~` is expanded here so the loaders that join `repoRoot` never mishandle a home path.
+  const searchPaths = (validated.skillSearchPaths || []).map((p) => expandHomePath(p));
+  if (searchPaths.length) validated.skillsDirs = [...(validated.skillsDirs || []), ...searchPaths];
+  return validated;
+}
+
+/**
+ * `--host` adds a destination to this run's list; `--host none` collects locally only.
+ * It adds rather than replaces because the flag is for "also look over there today",
+ * and the one case that needs replacing - skip everything configured - has its own word.
+ */
+export function applyHostFlag(configured, flagValues) {
+  if (!flagValues?.length) return configured;
+  const named = flagValues.map((value) => String(value));
+  if (named.includes("none")) return [];
+  const out = [...(configured || [])];
+  for (const host of named) {
+    const already = out.some((entry) => (typeof entry === "string" ? entry : entry?.host) === host);
+    if (!already) out.push(host);
+  }
+  return out;
 }
 
 export function repoConfigPath(repoRoot) {
@@ -359,9 +565,8 @@ export function initialConfig() {
     // maxEditsPerRun stays unset so the adaptive cap applies; set it to pin a number.
     minGapEvidence: DEFAULT_CONFIG.minGapEvidence,
     maxTranscripts: DEFAULT_CONFIG.maxTranscripts,
-    // Agents stay unset so the ladder auto-pick keeps applying to initialized repos.
-    analysis: { agent: null, model: null, effort: null },
-    synthesis: { agent: null, model: null, effort: null },
+    // Agent roles stay unset so initialized repos inherit global pins, or the default
+    // auto-pick when no global pin exists.
     discovery: { harnesses: ALL_HARNESSES, since: "30d", worktreeGlobs: [], minUserTurns: 2 },
     jobs: DEFAULT_CONFIG.jobs,
   };
