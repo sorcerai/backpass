@@ -225,17 +225,15 @@ function migrateEvidenceRecord(record, transcript, identity) {
   };
 }
 
-export const ANALYSIS_INDEX_VERSION = 2;
+export const ANALYSIS_INDEX_VERSION = 3;
 
 /**
  * Cache key for a transcript's analysis: its content signature, the memory-surface hash,
  * and the analysis index version. Changing any of them invalidates the evidence.
  */
 export function evidenceKey(transcript, memoryHash) {
-  return (
-    `${transcriptIdentity(transcript)}:${transcript.mtimeMs}:${transcript.bytes}:${memoryHash}:` +
-    `analysis-index-v${ANALYSIS_INDEX_VERSION}`
-  );
+  const content = transcript.contentSignature || `${transcript.mtimeMs}:${transcript.bytes}`;
+  return `${transcriptIdentity(transcript)}:${content}:${memoryHash}:analysis-index-v${ANALYSIS_INDEX_VERSION}`;
 }
 
 /**
