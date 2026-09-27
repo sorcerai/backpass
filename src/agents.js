@@ -53,6 +53,7 @@ export const VERDICT_LABELS = {
   "model-unavailable": "model not advertised",
   unreachable: "not installed / not spawnable",
   timeout: "probe timed out",
+  "empty-output": "returned no output",
 };
 
 const LOGIN_HINTS = {
@@ -267,9 +268,23 @@ function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function hintFor(agent, verdict) {
+/**
+ * "empty-output" is not always fixed by logging in - a genuinely blank, silent call
+ * can also be a quota/credits problem invisible to backpass. But when the harness did
+ * write something to stderr, that text is the actual diagnosis and belongs in front of
+ * this generic advice, not instead of it - see `assertNonEmptyOutput` in acpx.js.
+ */
+const EMPTY_OUTPUT_HINT = "check the provider account behind this model (quota, credits, a suspended key)";
+
+function emptyOutputHint(stderr) {
+  const line = firstLine(stderr);
+  return line ? `${EMPTY_OUTPUT_HINT} - stderr: ${line}` : EMPTY_OUTPUT_HINT;
+}
+
+function hintFor(agent, verdict, stderr) {
   if (verdict === "unauthenticated" && LOGIN_HINTS[agent]) return `-> run: ${LOGIN_HINTS[agent]}`;
   if (verdict === "unreachable") return `-> install the ${agent} CLI`;
+  if (verdict === "empty-output") return `-> ${emptyOutputHint(stderr)}`;
   return "";
 }
 
@@ -468,7 +483,7 @@ export class AgentResolver {
    * there is something to fall through to (the next `resolve(role)` walks on), false
    * when the pick was pinned by the user - then the error is theirs to see.
    */
-  async demote(role, pick, verdict, detail = "") {
+  async demote(role, pick, verdict, detail = "", stderr = "") {
     if (pick.pinned) return false;
     const key = candidateKey({ agent: pick.agent, model: pick.ladderModel });
     if (this.memo.get(key)?.verdict === "ok") {
@@ -480,6 +495,7 @@ export class AgentResolver {
         resolvedModel: null,
         checkedAt: new Date(this.now()).toISOString(),
         ...(authState === null ? {} : { authState }),
+        ...(stderr ? { stderr } : {}),
       };
       this.memo.set(key, entry);
       const cache = await this.loadCache();
@@ -505,7 +521,7 @@ export class AgentResolver {
         const verdict = isAcpxError ? classifyAcpxFailure(err) : null;
         if (isAcpxError && pick.pinned) throw pinnedFailureError(role, pick, verdict, err);
         if (!verdict) throw err;
-        await this.demote(role, pick, verdict, err.message);
+        await this.demote(role, pick, verdict, err.message, isAcpxError ? err.stderr : "");
       }
     }
   }
@@ -543,6 +559,8 @@ function pinnedFailureError(role, pick, verdict, err) {
     hint = `run: ${LOGIN_HINTS[pick.agent]}; ${pin}`;
   } else if (verdict === "unreachable") {
     hint = `install the ${pick.agent} CLI; ${pin}`;
+  } else if (verdict === "empty-output") {
+    hint = `${emptyOutputHint(err?.stderr)}; ${pin}`;
   } else if (verdict) {
     hint = pin;
   }
@@ -554,11 +572,17 @@ function exhaustedError(role, trail) {
   const width = Math.max(...trail.map((t) => t.model.length));
   const lines = trail.map((t) => {
     const label = VERDICT_LABELS[t.verdict] || t.verdict;
-    const hint = hintFor(t.agent, t.verdict);
+    const hint = hintFor(t.agent, t.verdict, t.stderr);
     return `  ${t.model.padEnd(width)}  ${t.agent.padEnd(9)} ${label}${t.detail ? ` (${t.detail})` : ""}${hint ? `  ${hint}` : ""}`;
   });
-  return new UserError(
-    `no available agent for the ${role} pass\n\n${lines.join("\n")}`,
-    `log in to one of the harnesses above, or pin one explicitly: backpass --${role}-agent <agent> --${role}-model <id>`,
-  );
+  // "log in" is only true advice when something in the trail is actually an auth
+  // failure - an all-"empty-output" trail (exhausted credits) needs its own line, not
+  // login instructions that don't apply to any candidate shown above.
+  const pinHint = `pin one explicitly: backpass --${role}-agent <agent> --${role}-model <id>`;
+  const closing = trail.some((t) => t.verdict === "unauthenticated")
+    ? `log in to one of the harnesses above, or ${pinHint}`
+    : trail.every((t) => t.verdict === "empty-output")
+      ? `${EMPTY_OUTPUT_HINT} for the candidates above, or ${pinHint}`
+      : pinHint;
+  return new UserError(`no available agent for the ${role} pass\n\n${lines.join("\n")}`, closing);
 }
