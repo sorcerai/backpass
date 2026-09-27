@@ -14,6 +14,7 @@ import {
   ensureSkillsLayout,
   loadProjectSkills,
   loadedCopies,
+  logicalSkillDir,
   parseFrontmatter,
   removeOwnedSkillPaths,
   resolveOverflowTarget,
@@ -437,6 +438,24 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
   }
   if (results.failed.length) return results;
 
+  // Skill paths were frozen into the proposal at propose time under whatever skillsDir
+  // was configured then; writing them now under a different one would silently ignore
+  // the current run's --skills-dir instead of writing where it says. Refuse rather than
+  // remap - a later apply should re-propose against the new location.
+  const proposedSkillsDir = proposal.config?.skillsDir;
+  const currentSkillsDir = config.skillsDir || CANONICAL_SKILLS_DIR;
+  const skillsDirMismatch =
+    proposedSkillsDir && logicalSkillDir(repo.root, proposedSkillsDir) !== logicalSkillDir(repo.root, currentSkillsDir);
+  if (plannedSkills.length && skillsDirMismatch) {
+    results.failed.push({
+      error:
+        `this proposal was generated with skillsDir=${proposedSkillsDir}; the current run is configured ` +
+        `with skillsDir=${currentSkillsDir} - re-run \`backpass propose\` with the new skillsDir, or apply ` +
+        "without overriding it",
+    });
+    return results;
+  }
+
   const existingSkillPaths = new Set(skillsNow.map((skill) => skill.path));
   let descriptionTokensProjected = descriptionTokensNow;
   for (const item of resolvedPlanned) {
@@ -450,7 +469,7 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     0,
   );
   const memoryPlan = resolvedPlanned.find((item) => item.relative === proposal.memoryFile.path);
-  if (accepted.length) {
+  if (memoryPlan || plannedSkills.length || resolvedPlanned.some((item) => existingSkillPaths.has(item.relative))) {
     const budgetFailure = acceptedSubsetBudgetFailure({
       proposal,
       capTokens: config.budgetTokens,
@@ -464,6 +483,41 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
       return results;
     }
   }
+  // A nested memory file is a weight of its own with a budget of its own: the accepted
+  // subset that lands in it clears the same cap/shrink gate the root surface does.
+  const nestedBudgets = new Map();
+  for (const nested of proposal.nested || []) {
+    const plan = resolvedPlanned.find((item) => item.relative === nested.memoryFile.path);
+    if (!plan) continue;
+    if (!config.nestedMemoryFiles?.includes(plan.relative)) {
+      results.failed.push({
+        file: plan.relative,
+        error: `${plan.relative} is no longer named in nestedMemoryFiles; re-run \`backpass propose\` with the current scope`,
+      });
+      continue;
+    }
+    const capTokens = config.nestedBudgetTokens ?? config.budgetTokens;
+    const budget = budgetStatus(plan.before, plan.text, capTokens);
+    const gate = budgetGateKind(budget);
+    if (gate === "cap") {
+      results.failed.push({
+        file: plan.relative,
+        error:
+          `accepted edits leave ${plan.relative} at ${budget.projected} tokens, ${budget.over} over its ` +
+          `${capTokens}-token budget; choose a compatible set of edits`,
+      });
+    } else if (gate === "shrink") {
+      results.failed.push({
+        file: plan.relative,
+        error:
+          `${plan.relative} is already ${budget.current - capTokens} tokens over its ${capTokens}-token budget, ` +
+          `so accepted edits must shrink it, but they change it by ${budget.delta >= 0 ? "+" : ""}${budget.delta} ` +
+          "tokens; choose a compatible set of edits",
+      });
+    }
+    nestedBudgets.set(plan.relative, budget);
+  }
+  if (results.failed.length) return results;
 
   const canonical = plannedSkills.find(
     ({ skill }) => skill.path === CANONICAL_SKILLS_DIR || skill.path.startsWith(`${CANONICAL_SKILLS_DIR}/`),
@@ -546,7 +600,7 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     results.written = [];
   };
   const landedDescriptionDelta = descriptionTokensProjected - descriptionTokensNow;
-  const budgetTarget = memoryPlan || orderedPlanned[0];
+  const budgetTarget = memoryPlan || orderedPlanned.find((item) => !nestedBudgets.has(item.relative));
   const surfaceBudget = budgetTarget
     ? budgetStatus(memoryText, memoryPlan?.text ?? memoryText, config.budgetTokens, {
         current: descriptionTokensNow,
@@ -555,7 +609,7 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     : null;
   for (const item of orderedPlanned) {
     const { relative, resolved, text, applied } = item;
-    const budget = item === budgetTarget ? surfaceBudget : null;
+    const budget = item === budgetTarget ? surfaceBudget : (nestedBudgets.get(relative) ?? null);
 
     let commit = null;
     try {
@@ -574,6 +628,9 @@ export function applyDecisions({ proposal, decisions, repo, state, config, dryRu
     results.written.push({ file: relative, edits: applied, budget, dryRun });
   }
 
+  for (const [relative, budget] of nestedBudgets) {
+    if (!budget.withinBudget) results.warnings.push(overBudgetWarning(relative, budget));
+  }
   if (surfaceBudget && !surfaceBudget.withinBudget) {
     results.warnings.push(
       overBudgetWarning(
