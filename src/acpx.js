@@ -46,7 +46,10 @@ export function effortOptionKey(agent) {
 }
 
 export class AcpxError extends Error {
-  constructor(message, { stdout = "", stderr = "", code = null, timedOut = false, spawnError = null } = {}) {
+  constructor(
+    message,
+    { stdout = "", stderr = "", code = null, timedOut = false, spawnError = null, emptyOutput = false } = {},
+  ) {
     super(message);
     this.name = "AcpxError";
     this.stdout = stdout;
@@ -56,6 +59,8 @@ export class AcpxError extends Error {
     this.spawnError = spawnError;
     /** Set when the adapter has no session support at all (not an availability verdict). */
     this.unsupported = false;
+    /** Set when the call exited clean but produced no usable text - see `assertNonEmptyOutput`. */
+    this.emptyOutput = emptyOutput;
   }
 }
 
@@ -129,8 +134,8 @@ function sessionCreateTimeoutError({ agent, acpxAgentArgs, timeoutMs }) {
  * acpx reports these on stderr as `[acpx] error: RUNTIME AUTH_REQUIRED ...` and
  * `Cannot apply --model "x": the ACP agent did not advertise that model`.
  *
- * @param {{ stderr?: string, spawnError?: { code?: string } | null, timedOut?: boolean }} failure
- * @returns {"unauthenticated" | "model-unavailable" | "unreachable" | null}
+ * @param {{ stderr?: string, spawnError?: { code?: string } | null, timedOut?: boolean, emptyOutput?: boolean }} failure
+ * @returns {"unauthenticated" | "model-unavailable" | "unreachable" | "empty-output" | null}
  */
 export function classifyAcpxFailure(failure) {
   if (!failure) return null;
@@ -141,6 +146,9 @@ export function classifyAcpxFailure(failure) {
   if (/\b(ENOENT|command not found|not found on PATH|failed to spawn|spawn .* ENOENT)\b/i.test(text)) {
     return "unreachable";
   }
+  // Checked last: a non-empty stderr that matches one of the patterns above is a more
+  // specific diagnosis than "no output", and must not be shadowed by it.
+  if (failure.emptyOutput) return "empty-output";
   return null;
 }
 
@@ -198,6 +206,116 @@ export function extractJson(text) {
     }
   }
   return null;
+}
+
+/** True when a model turn produced no usable text at all (blank or whitespace-only). */
+export function isBlankOutput(text) {
+  return !(text || "").trim();
+}
+
+/**
+ * A call that exits clean but returns no text at all is a silent failure, not a
+ * quality problem: the prompt contract always requires at least an empty JSON object
+ * (`"An empty array is a valid and useful answer"`), so blank output means the turn
+ * never really ran - most often an upstream provider error (exhausted credits, a
+ * suspended key) that an ACP bridge swallows without ever writing to stderr. Unlike
+ * garbled prose, no real work was done, so it is safe to demote the candidate and
+ * retry with the next one in the ladder rather than burning the whole run on it.
+ * Call this from inside a `withFallthrough` callback, before the caller's own
+ * `extractJson` check, so the throw is still in scope to trigger a fallthrough.
+ *
+ * Not for every model call: synthesis's edit turn never reads its own `text` (the edit
+ * happens through tool calls, so blank is normal there) and its annotate turn
+ * deliberately never switches agents mid-session - see `src/synthesize.js`. Both stay
+ * on `isBlankOutput` directly instead.
+ *
+ * @param {{ text: string, raw?: string, stderr?: string }} result
+ * @param {{ agent: string, model?: string | null }} pick
+ */
+export function assertNonEmptyOutput(result, { agent, model }) {
+  if (!isBlankOutput(result.text)) return result;
+  throw new AcpxError(`${agent} (${model || "default"}) returned no output`, {
+    stdout: result.raw ?? result.text,
+    // Even when the call itself is unclassifiable beyond "empty-output", a non-empty
+    // stderr is real diagnostic text (e.g. a provider error an ACP bridge otherwise
+    // swallows) and must reach the caller rather than being dropped here.
+    stderr: result.stderr || "",
+    emptyOutput: true,
+  });
+}
+
+/**
+ * Fraction of the configured `--timeout` budget a textless quiet exit must have
+ * consumed before it is read as acpx's own timeout kill rather than a silent provider
+ * failure. acpx starts its budget when the turn spawns, so the kill lands at or just
+ * past the full budget; the floor only absorbs start-up skew, never most of it.
+ */
+const BLANK_AT_BUDGET_FLOOR = 0.9;
+
+/**
+ * Name a clean exit that produced no text after consuming (almost) the whole
+ * `--timeout` budget as the acpx timeout kill it is - by timeout, not `empty-output`.
+ *
+ * backpass enforces the model budget with an outer kill of its own at budget + 30s
+ * (`result.timedOut`), but acpx enforces `--timeout` first: when the harness dies at
+ * the budget, `--format quiet` has the process exit clean with blank output, and the
+ * outer kill never fires. Read generically that blank result reaches
+ * `assertNonEmptyOutput` as a silent provider failure - an `empty-output` verdict
+ * whose hints point at exhausted credits - misreporting a timeout as a provider
+ * problem. Wall clock is the only remaining signal: a blank result that spent (almost)
+ * the whole budget is that kill; one clearly short of it keeps the empty-output
+ * diagnosis. Same contract as the session-create timeout: raised by name, before any
+ * generic handling, and deliberately not classifiable - a run never silently switches
+ * models after real work has started.
+ *
+ * Only for one-shot analysis calls (`execOneShot`, `sessionPrompt`). Synthesis's edit
+ * turn never reads its own text - edits land through tool calls, so blank there is
+ * normal even after a long turn - which is why this never runs inside `openSession`'s
+ * `prompt()`.
+ *
+ * @param {{ agent: string, label: "exec" | "session prompt", text?: string, stdout?: string,
+ *   stderr?: string, code?: number | null, elapsedMs: number, timeoutSeconds?: number }} call
+ */
+function assertNotAcpxBudgetKill({
+  agent,
+  label,
+  text,
+  stdout = "",
+  stderr = "",
+  code = null,
+  elapsedMs,
+  timeoutSeconds,
+}) {
+  if (!isBlankOutput(text)) return;
+  if (!(timeoutSeconds > 0)) return;
+  if (elapsedMs < timeoutSeconds * 1000 * BLANK_AT_BUDGET_FLOOR) return;
+  throw new AcpxError(`acpx ${agent} ${label} timed out after ${timeoutSeconds}s`, {
+    stdout,
+    stderr,
+    code,
+    timedOut: true,
+  });
+}
+
+/**
+ * Run one model turn - a one-shot `exec` when no effort override is needed, or a
+ * fresh named session when it is (`sessionName` is called only in that branch, so a
+ * caller's own call counter advances only for calls that actually open a session) -
+ * and reject blank output via `assertNonEmptyOutput`. A blank result that consumed
+ * (almost) the whole `--timeout` budget is named a timeout first
+ * (`assertNotAcpxBudgetKill`), so acpx's own kill never reads as a provider failure.
+ * Shared by `analyze.js` and `consolidate.js`; call from inside a `withFallthrough`
+ * callback so a blank result still falls through to the next candidate.
+ *
+ * @param {Parameters<typeof execOneShot>[0]} call
+ * @param {{ agent: string, model?: string | null, effort?: string | null }} pick
+ * @param {{ sessionName: () => string }} options
+ */
+export async function runModelCall(call, pick, { sessionName }) {
+  const result = pick.effort
+    ? await sessionPrompt({ ...call, effort: pick.effort, sessionName: sessionName() })
+    : await execOneShot(call);
+  return assertNonEmptyOutput(result, pick);
 }
 
 /**
@@ -280,7 +398,7 @@ export async function acpxVersion({ timeoutMs = 10_000 } = {}) {
  * real auth gate (ACP -32000); for claude it is not, which is why `src/agents.js`
  * checks `claude auth status` before ever calling this.
  *
- * @returns {Promise<{ verdict: "ok" | "unauthenticated" | "model-unavailable" | "unreachable" | "timeout",
+ * @returns {Promise<{ verdict: "ok" | "unauthenticated" | "model-unavailable" | "unreachable" | "timeout" | "empty-output",
  *   detail: string, availableModels: string[], transient?: boolean }>}
  */
 export async function probeSession({
@@ -368,6 +486,7 @@ export async function execOneShot({
         "use a named session or omit the effort override",
       );
     }
+    const execStartedAt = Date.now();
     const result = await run(args, { timeoutMs: (timeoutSeconds + 30) * 1000, cwd, env: invocation.env });
     if (result.spawnError && result.spawnError.code === "ENOENT") throw notFoundError(result);
     if (result.timedOut) {
@@ -379,10 +498,26 @@ export async function execOneShot({
         result,
       );
     }
+    assertNotAcpxBudgetKill({
+      agent,
+      label: "exec",
+      text: stripAcpxNoise(result.stdout),
+      stdout: result.stdout,
+      stderr: result.stderr,
+      code: result.code,
+      elapsedMs: Date.now() - execStartedAt,
+      timeoutSeconds,
+    });
 
     const combined = `${result.stdout}\n${result.stderr}`;
     const usage = parseTokenLine(combined) ?? recoverUsageFromStore({ agent, promptFile, cwd, startedAt });
-    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, notes: invocation.notes };
+    return {
+      text: stripAcpxNoise(result.stdout),
+      usage,
+      raw: result.stdout,
+      stderr: result.stderr,
+      notes: invocation.notes,
+    };
   } finally {
     invocation.dispose();
   }
@@ -406,7 +541,7 @@ export async function execOneShot({
  * @returns {Promise<{ notes: string[],
  *   prompt: (options: { promptFile: string, timeoutSeconds?: number, promptRetries?: number,
  *     approveReads?: boolean, approveAll?: boolean, suppressReads?: boolean }) =>
- *     Promise<{ text: string, usage: Record<string, number> | null, raw: string, notes: string[] }>,
+ *     Promise<{ text: string, usage: Record<string, number> | null, raw: string, stderr: string, notes: string[] }>,
  *   close: () => Promise<void> }>}
  */
 export async function openSession({
@@ -560,7 +695,7 @@ export async function openSession({
       usage = cumulative ? subtractUsage(cumulative, storeUsageSeen) : null;
       if (cumulative) storeUsageSeen = cumulative;
     }
-    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, notes };
+    return { text: stripAcpxNoise(result.stdout), usage, raw: result.stdout, stderr: result.stderr, notes };
   };
 
   return { notes, prompt, close };
@@ -620,8 +755,19 @@ export async function sessionPrompt({
     return { ...fallback, notes };
   }
 
+  const promptStartedAt = Date.now();
   try {
-    return await session.prompt({ promptFile, timeoutSeconds, promptRetries, approveReads, suppressReads });
+    const result = await session.prompt({ promptFile, timeoutSeconds, promptRetries, approveReads, suppressReads });
+    assertNotAcpxBudgetKill({
+      agent,
+      label: "session prompt",
+      text: result.text,
+      stdout: result.raw,
+      stderr: result.stderr,
+      elapsedMs: Date.now() - promptStartedAt,
+      timeoutSeconds,
+    });
+    return result;
   } finally {
     await session.close();
   }

@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { extractJson, openSession, usageRecord } from "./acpx.js";
-import { userClaudeSkillsDir } from "./config.js";
+import { extractJson, isBlankOutput, openSession, usageRecord } from "./acpx.js";
+import { expandHomePath, userClaudeSkillsDir } from "./config.js";
 import { renderEvidenceForPrompt } from "./fold.js";
 import { renderInstructionIndex, resolveMemoryPath } from "./memory.js";
 import { renderPrompt, render, loadPrompt } from "./prompts.js";
@@ -17,7 +17,13 @@ import {
 import { isSuppressedByRejection } from "./state.js";
 import { SURFACE_TARGET } from "./target.js";
 import { emitProgress } from "./progress.js";
-import { measureWorkspace, prepareWorkspace, repoFingerprint, workspacePathFor } from "./workspace.js";
+import {
+  READ_ONLY_SEARCH_PATH,
+  measureWorkspace,
+  prepareWorkspace,
+  repoFingerprint,
+  workspacePathFor,
+} from "./workspace.js";
 import { UserError, color, info, warn } from "./logger.js";
 
 /**
@@ -70,6 +76,8 @@ const EMPTY_TURN_VIOLATION =
   "the synthesis harness ended its turn with no output at all - no JSON, no prose, no tool call";
 const UNPARSEABLE_VIOLATION = "synthesis answered with text, but not with a JSON object";
 const KEPT_EDITING_VIOLATION = "synthesis kept editing the staging copy instead of annotating the measured changes";
+const EDIT_EMPTY_VIOLATION =
+  "the synthesis edit turn left the staging copy byte-identical to the original, so its first annotate turn had nothing to describe";
 
 /**
  * The budget the prompts frame is the always-loaded surface: the memory file plus
@@ -77,11 +85,20 @@ const KEPT_EDITING_VIOLATION = "synthesis kept editing the staging copy instead 
  * (`buildProposal`). Framing one number and gating another would set the model up to
  * fail a gate it was never told about.
  */
-function budgetRule(memoryFile, config, maxEdits, descriptionTokens = 0) {
+function budgetRule(memoryFile, config, maxEdits, descriptionTokens = 0, { extraction = true } = {}) {
   const remaining = config.budgetTokens - memoryFile.tokens - descriptionTokens;
   const counted = descriptionTokens
     ? ` The budget counts this file plus every skill description line (${descriptionTokens} tok of descriptions today); skill bodies stay free until triggered.`
     : "";
+  if (remaining <= 0 && !extraction) {
+    return (
+      `This file is ALREADY ${Math.abs(remaining)} tokens OVER its budget, so this run is a SHRINK PLAN. ` +
+      `You are NOT expected to reach ${config.budgetTokens} tokens in one run - the ${maxEdits}-edit cap ` +
+      `makes that impossible and later runs continue the work. What is required is real progress: the edit ` +
+      `set MUST be net-negative. Remove what has its harm-evidence floor, tighten what the evidence ` +
+      `supports rewriting, and make any addition name the removal that pays for it.`
+    );
+  }
   if (remaining <= 0) {
     return (
       `The always-loaded surface is ALREADY ${Math.abs(remaining)} tokens OVER budget, so this run is a SHRINK ` +
@@ -100,7 +117,7 @@ function budgetRule(memoryFile, config, maxEdits, descriptionTokens = 0) {
   if (remaining < config.budgetTokens * 0.15) {
     return (
       `Only ${remaining} tokens of headroom remain. Treat this as zero-sum: every addition must ` +
-      `name its offsetting removal or skill extraction. The post-edit always-loaded surface must stay at or below ` +
+      `name its offsetting removal${extraction ? " or skill extraction" : ""}. The post-edit always-loaded surface must stay at or below ` +
       `${config.budgetTokens} tokens.` +
       counted
     );
@@ -147,7 +164,9 @@ function harnessCountsOf(transcripts) {
  * reaches that decision. An ordinary repository skill stays fingerprinted either way. A
  * fingerprinted path can still resolve outside the repository - that is the ordinary
  * user-scope layout - so a change there is reported for what it is rather than as a direct
- * repository edit.
+ * repository edit. A configured `skillSearchPaths` root is the one withheld reason that
+ * stays fingerprinted anyway: its read-only promise is not "backpass will never write
+ * this," it is "nothing may ever write this," so a change there must still fail the run.
  */
 function assertRepoUntouched(repo, before, workspaceRoot) {
   const after = repoFingerprint(repo, Object.keys(before));
@@ -184,6 +203,16 @@ function assertRepoUntouched(repo, before, workspaceRoot) {
 }
 
 function targetRule(target, memoryPath, skillsDir, stagedTargetPath = null, unstageable = []) {
+  if (target.nested) {
+    const dir = path.posix.dirname(memoryPath);
+    return (
+      `0. **This run trains the nested memory file \`./${memoryPath}\` only.** Harnesses load it on top of ` +
+      `the root memory file, and only when a session works under \`${dir}/\`; every session in the evidence ` +
+      `below worked there. Skills belong to the root surface: do not create, extend, or edit a skill, and do ` +
+      `not extract - the extraction rules and the placement table below do not apply to this run. A lesson ` +
+      `that is not specific to \`${dir}/\` belongs in the root memory file, which its own pass trains.\n`
+    );
+  }
   if (target.kind === "skill") {
     return (
       `0. **This run targets \`./${stagedTargetPath || workspacePathFor(target.path)}\` only.** It is the one staged file. ` +
@@ -211,17 +240,29 @@ function targetRule(target, memoryPath, skillsDir, stagedTargetPath = null, unst
  * Everything the edit and annotation turns need: prompt values, the `buildProposal`
  * context, and the overflow target.
  */
-function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scope = null }) {
+function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scope = null, routing = null }) {
   const state = config.state;
   const rejections = state.readRejections();
   const userScope = scope?.kind === "user";
+  // A nested memory file is trained on its own: skills belong to the root surface, so
+  // none is staged, billed, or offered as an extraction target (`src/nested.js`).
+  const nested = config.target?.nested === true;
   const overflow = resolveOverflowTarget(repo.root, config.skillsDir, {
     claudeSkillsDir: userScope ? userClaudeSkillsDir() : undefined,
     allowExternal: userScope,
   });
-  for (const w of overflow.warnings) warn(w);
-  const skillDirs = resolveProjectSkillDirs(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
-  const skillFiles = loadProjectSkills(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  if (!nested) for (const w of overflow.warnings) warn(w);
+  const skillDirs = nested
+    ? []
+    : resolveProjectSkillDirs(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  const skillFiles = nested
+    ? []
+    : loadProjectSkills(repo.root, overflow.dir, config.skillsDirs || [], { exact: userScope });
+  // `skillSearchPaths` rides `skillDirs` for awareness (config.js), but staging must
+  // refuse it unconditionally - unlike the rest of `skillDirs`, it is never writable, in
+  // no scope, so `prepareWorkspace` needs the raw roots to enforce that independently of
+  // `allowExternal`.
+  const searchPathRoots = (config.skillSearchPaths || []).map((p) => expandHomePath(p));
   // The budget is the whole always-loaded surface whatever the target: a skill target
   // moves it by that skill's description-line delta, nothing else changes.
   const descriptionTokens = skillDescriptionTokens(skillFiles);
@@ -230,7 +271,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
 
   const common = {
     MEMORY_PATH: workspacePathFor(memoryFile.path),
-    BUDGET_RULE: budgetRule(memoryFile, config, maxEdits, descriptionTokens),
+    BUDGET_RULE: budgetRule(memoryFile, config, maxEdits, descriptionTokens, { extraction: !nested }),
     MAX_EDITS: String(maxEdits),
     MIN_GAP_EVIDENCE: String(config.minGapEvidence),
   };
@@ -246,6 +287,7 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
     isSuppressed: isSuppressedByRejection,
     skillFiles,
     target,
+    routing,
   };
 
   const promptDir = path.join(state.root, "prompts");
@@ -257,7 +299,9 @@ function synthesisSetup({ memoryFile, summary, config, repo, harnessCounts, scop
     overflow,
     skillDirs,
     skillFiles,
+    searchPathRoots,
     target,
+    nested,
     descriptionTokens,
     maxEdits,
     common,
@@ -302,6 +346,9 @@ function terminalMessage(reason, attempts, violations) {
   }
   if (reason === "editing") {
     return `synthesis kept editing the staging copy instead of annotating it (${REMEASURE_TURNS} re-measurements)`;
+  }
+  if (reason === "edit-empty") {
+    return "synthesis made no changes to the staging copy during the edit turn, so its first annotate turn had nothing to describe";
   }
   return (
     `synthesis could not produce a valid proposal after ${Math.max(attempts - 1, 0)} re-prompt(s) ` +
@@ -348,10 +395,16 @@ async function annotateLoop({
   let saved = null;
   /** @type {{ reason: string, violations: string[] }} */
   let terminal;
+  // Whether the edit turn that preceded this loop left the staging copy untouched - a
+  // stray out-of-scope edit still counts as touched, so it is never hidden behind
+  // "edit-empty". Only the very first turn's measurement answers that question; a later
+  // remeasure reflects edits made during annotation instead, which "editing" already covers.
+  let editMadeNoChanges = false;
 
   for (let turn = 1; ; turn += 1) {
     assertRepoUntouched(repo, fingerprint, workspace.root);
     const measured = measureWorkspace(workspace);
+    if (turn === 1) editMadeNoChanges = measured.changes.length === 0 && !(measured.stray || []).length;
 
     let prompt = renderPrompt("annotate", {
       ...common,
@@ -397,8 +450,14 @@ async function annotateLoop({
     justRemeasured = false;
 
     // An empty turn is not a bad answer; it is no answer. Retry it once in a new session,
-    // because the accumulated context of this one is the likeliest reason it collapsed.
-    if (!(result.text || "").trim()) {
+    // because the accumulated context of this one is the likeliest reason it collapsed -
+    // unless the edit turn left nothing to describe in the first place, in which case a
+    // fresh session would be shown the same empty diff and retrying is pointless.
+    if (isBlankOutput(result.text)) {
+      if (turn === 1 && editMadeNoChanges) {
+        terminal = { reason: "edit-empty", violations: [EDIT_EMPTY_VIOLATION] };
+        break;
+      }
       emptyTurns += 1;
       if (emptyTurns > EMPTY_TURN_RETRIES) {
         terminal = { reason: "empty", violations: [EMPTY_TURN_VIOLATION] };
@@ -417,6 +476,10 @@ async function annotateLoop({
     attempts += 1;
     const parsed = extractJson(result.text);
     if (!parsed) {
+      if (turn === 1 && editMadeNoChanges) {
+        terminal = { reason: "edit-empty", violations: [EDIT_EMPTY_VIOLATION] };
+        break;
+      }
       violationsToShow = [UNPARSEABLE_VIOLATION];
       if (attempts >= ANNOTATE_TURNS) {
         terminal = { reason: "unparseable", violations: violationsToShow };
@@ -467,6 +530,7 @@ export async function synthesizeProposal({
   transcripts,
   runNote = "",
   scope = null,
+  routing = null,
 }) {
   config.state.clearProposal();
   const harnessCounts = harnessCountsOf(transcripts);
@@ -476,7 +540,9 @@ export async function synthesizeProposal({
     overflow,
     skillDirs,
     skillFiles,
+    searchPathRoots,
     target,
+    nested,
     descriptionTokens,
     maxEdits,
     common,
@@ -489,6 +555,7 @@ export async function synthesizeProposal({
     repo,
     harnessCounts,
     scope,
+    routing,
   });
 
   // Staging holds only the write surface: every skill on a surface run, none of them on
@@ -502,6 +569,7 @@ export async function synthesizeProposal({
     skillDirs,
     stagedSkills,
     allowExternal: scope?.kind === "user",
+    searchPathRoots,
   };
   let workspace = prepareWorkspace(workspaceOptions);
   const stagedSkillsDir =
@@ -540,7 +608,12 @@ export async function synthesizeProposal({
     BUDGET_STATE: budgetState(memoryFile, config, descriptionTokens),
     INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
     SKILLS_DIR: stagedSkillsDir,
-    SKILL_INDEX: renderSkillIndex(stagedSkillFiles),
+    SKILL_INDEX: nested
+      ? "(skills belong to the root surface; a nested memory file run does not edit them)"
+      : renderSkillIndex(stagedSkillFiles),
+    BUDGET_COUNT: nested
+      ? "The count is this file alone: it loads on top of the root memory\nfile, which has a budget of its own."
+      : "The count is this file PLUS every skill's `description:` line;\nskill bodies are free until triggered.",
     EVIDENCE: renderEvidenceForPrompt(summary),
     REJECTIONS: renderRejections(rejections),
   };
@@ -548,9 +621,21 @@ export async function synthesizeProposal({
   const editPromptFile = path.join(promptDir, "synthesis-edit.md");
   fs.writeFileSync(editPromptFile, renderPrompt("synthesis", editValues));
 
+  // A search-path skill is unstageable like any other read-only skill, but unlike the
+  // rest of them the read-only promise it carries must be enforceable: a direct write to
+  // it has to be detected, not silently excused the way an ordinary withheld skill is
+  // (design note above `assertRepoUntouched`). It stays in the fingerprint so a change
+  // there still fails the run loudly.
   const fingerprint = repoFingerprint(repo, [
-    memoryFile.path,
-    ...skillFiles.filter((skill) => !readOnlyReason(skill.path)).map((skill) => skill.path),
+    ...new Set(
+      [memoryFile.path, ...config.memoryFiles, ...(config.nestedMemoryFiles || []), routing?.rootPath].filter(Boolean),
+    ),
+    ...skillFiles
+      .filter((skill) => {
+        const reason = readOnlyReason(skill.path);
+        return !reason || reason === READ_ONLY_SEARCH_PATH;
+      })
+      .map((skill) => skill.path),
   ]);
   const sessionName = `backpass-synth-${process.pid}`;
   const timeoutSeconds = Math.max(config.timeoutSeconds, 900);
@@ -565,7 +650,7 @@ export async function synthesizeProposal({
 
   const pick = await config.agents.resolve("synthesis");
   info(
-    `${color.cyan("·")} synthesizing with ${pick.agent}` +
+    `${color.cyan("·")} synthesizing ${nested ? `${memoryFile.path} (nested) ` : ""}with ${pick.agent}` +
       `${pick.model ? ` (${pick.model})` : ""}` +
       `${pick.effort ? ` effort=${pick.effort}` : ""}`,
   );

@@ -4,9 +4,10 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { UserError, fail, setQuiet } from "./logger.js";
-import { loadConfig, parseMaxTranscripts, parseScopeKind } from "./config.js";
+import { applyHostFlag, loadConfig, parseMaxTranscripts, parseScopeKind } from "./config.js";
 import { resolveRepo } from "./repo.js";
 import { printScopeNote, resolveScope } from "./scope.js";
+import { applyNestedMemoryConfig } from "./nested.js";
 import { printTargetNote, resolveTarget, TARGET_COMMANDS } from "./target.js";
 import { State } from "./state.js";
 import { AgentResolver } from "./agents.js";
@@ -36,6 +37,7 @@ const OPTIONS = {
   harness: { type: "string" },
   jobs: { type: "string" },
   strict: { type: "boolean" },
+  host: { type: "string", multiple: true },
   "include-cursor-ide": { type: "boolean" },
 
   budget: { type: "string" },
@@ -91,6 +93,9 @@ COLLECT SAMPLES
   --harness <a,b>          limit to these harnesses
                            (claude, codex, pi, opencode, grok, cursor, hermes)
   --strict                 deterministic associations only (tiers 1, 1.5, and 2)
+  --host <dest>            also collect from this SSH host this run (repeatable;
+                           "none" collects locally only). Configure hosts once in
+                           ~/.config/backpass/config.json; a repo file may not set them
   --include-cursor-ide     also scan the Cursor IDE store (best-effort, v1.1 preview)
   --limit <n>              analyze at most N transcripts this run (newest first)
   --max-transcripts <n>    cap per run; past it a recency-weighted sticky sample
@@ -145,6 +150,7 @@ or below 60 columns - stdout and --json output are identical either way.
 EXAMPLES
   backpass                                  a full run, ending with a proposal
   backpass scan --since 7d --strict         what would be collected, deterministic only
+  backpass scan --host mac-home             also collect this repo's sessions from mac-home
   backpass --scope user                     train the user-level memory file and skills
   backpass --target db                      train only the skill named db
   backpass --synthesis-agent claude --synthesis-model claude-opus-5
@@ -180,7 +186,11 @@ function overridesFrom(values) {
     overrides.discovery = overrides.discovery || {};
     overrides.discovery.includeProjects = values.project;
   }
-  if (values["memory-file"]?.length) overrides.memoryFiles = values["memory-file"];
+  // A run that names its memory files trains exactly those, never a nested one too.
+  if (values["memory-file"]?.length) {
+    overrides.memoryFiles = values["memory-file"];
+    overrides.nestedMemoryFiles = [];
+  }
   if (values["skills-dir"]) overrides.skillsDir = values["skills-dir"];
   if (values.theme) overrides.theme = values.theme;
 
@@ -259,8 +269,9 @@ export async function main(argv) {
       config = loadConfig(null, overrides, { kind: "user" });
     } else {
       repo = resolveRepo(process.cwd());
-      config = loadConfig(repo.root, overrides);
+      config = applyNestedMemoryConfig(repo.root, loadConfig(repo.root, overrides));
     }
+    config.discovery.hosts = applyHostFlag(config.discovery.hosts, values.host);
     const scope = resolveScope(process.cwd(), { ...values, scope: kind, strict: Boolean(values.strict) }, config, repo);
     printScopeNote(scope);
     if (values.target !== undefined && !TARGET_COMMANDS.has(commandName)) {
@@ -275,6 +286,9 @@ export async function main(argv) {
     // Resolved after the scope so user-scope entries and skill dirs are the ones matched.
     config.target = resolveTarget(values.target, scope);
     printTargetNote(config.target);
+    // Nested memory files are trained by a run over the whole surface; a targeted run
+    // trains its one file and never widens to them.
+    if (config.target.kind !== "surface") config.nestedMemoryFiles = [];
     config.memoryFiles = config.target.kind === "memory" ? [config.target.path] : scope.memoryFiles;
     config.skillsDir = scope.overflowDir;
     if (scope.skillDirs.length) config.skillsDirs = scope.skillDirs;
