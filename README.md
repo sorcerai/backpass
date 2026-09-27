@@ -24,17 +24,17 @@
 
 <h3 align="center">Gradient descent for your agent memory.</h3>
 
-Your `AGENTS.md` is a set of weights. Every agent session is a forward pass. The
-transcript that session leaves on disk is the loss signal - and today nothing reads it.
-The loop only closes when a human happens to remember a failure and edits the file by hand.
+[This blog post](https://blog.kunchenguid.com/p/your-agentsmd-is-a-neural-net) explains the why and how.
 
-`backpass` closes it. It finds the agent sessions that actually ran in your repo, reads
+`backpass` helps you improve your `AGENTS.md`, `CLAUDE.md` and skills with scientific rigor.
+It finds the agent sessions that actually ran in your repo, reads
 what happened in them, and proposes evidence-backed edits to your memory surface - the
 memory file and project skills - under a token budget, gated by you.
 
-- **Local-first** - Reads the transcript stores of seven agent harnesses directly from disk.
-  No API, no upload; transcripts never leave your machine except into an agent you already
-  authenticated, and obvious secrets are redacted before they do.
+- **Local-first** - Reads the transcript stores of seven agent harnesses directly from disk,
+  locally or over SSH to your own machines. No API, no upload; transcripts never leave your
+  machines except into an agent you already authenticated, and obvious secrets are redacted
+  before they do.
 - **Evidence-gated** - Every proposed edit carries verbatim quotes from real sessions,
   and every `add`, `rewrite`, or `remove` edit needs evidence from at least two distinct
   sessions. Small, noisy, bounded steps - not a rewrite.
@@ -84,8 +84,9 @@ Canonical user memory is the first existing file in this order: `~/.agents/AGENT
 `$CLAUDE_CONFIG_DIR/CLAUDE.md` (default `~/.claude/CLAUDE.md`), and
 `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`). User-level skill extractions
 default to `~/.agents/skills`, with a warning if Claude's active `skills` path is a
-real directory rather than the usual symlink. See [Configuration](#configuration) for
-using an existing harness-loaded directory instead.
+real directory rather than the usual symlink. Backpass leaves that directory untouched:
+see [Configuration](#configuration) for the scope-specific settings and manual merge
+guidance.
 
 In user scope every `add`, `rewrite`, or `remove` edit also clears `minGapProjects`
 (default `1`): the distinct projects behind its own quotes, counted from the gap
@@ -119,11 +120,71 @@ backpass --scope user
 backpass apply --scope user
 ```
 
+### Your other machines
+
+Sessions you ran on your own other machines can join the same corpus over SSH. Name the
+hosts once in your personal config:
+
+```json
+{
+  "discovery": {
+    "hosts": [
+      "mac-home",
+      {
+        "host": "kunchen@nixos-home",
+        "node": "/run/current-system/sw/bin/node",
+        "env": { "CLAUDE_CONFIG_DIR": "~/.claude-work" },
+        "harnesses": ["claude", "codex"]
+      }
+    ]
+  }
+}
+```
+
+`--host <dest>` adds one for a single run (repeatable), and `--host none` collects
+locally only. Hosts are **personal configuration**: a `discovery.hosts` in a repo's
+`.backpassrc.json` is refused by name, so a checked-in file can never point someone
+else's backpass at a machine. The personal file is
+`$XDG_CONFIG_HOME/backpass/config.json` (default `~/.config/backpass/config.json`).
+
+An object entry may set an absolute remote `node` path, an optional `harnesses` subset,
+a positive integer `connectTimeoutSeconds` (default `10`), and store relocation variables
+under `env`. The allowed variables are `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
+`PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, `BB_DATA_DIR`, and
+`BB_PI_BRIDGE_SESSION_DIR`.
+
+backpass installs nothing on the remote. It runs your own `ssh` (with `BatchMode=yes`,
+so a password prompt fails the host instead of hanging the run) and pipes a one-shot Node
+program holding its own adapters into `node -` over there. That program lists the
+sessions in the window, computes the filesystem and git facts about each session's cwd -
+which is the only place those paths are real - and exits, removing its temp directory.
+Association then runs here, with the same tiers, against those facts. Only the sessions
+that are associated, sampled, and not already analyzed are fetched: the raw transcript
+file for file-backed stores, so the analysis agent's raw-transcript escape hatch still
+opens a real file, and the adapter's normalized events for SQLite stores. Fetched copies
+are cached under the run's state directory (mode 0700) and pruned after 30 days unused;
+`backpass status` lists them per host.
+
+Remote tiers are the local ones with a lower ceiling. Nothing on another machine is
+tier 1 ("this clone"); a live remote checkout sharing a git remote with this repo is
+tier 1.5, a recorded remote is tier 2, and a dead path is tier 3. A session that exists
+on two machines is kept once, local copy first. Evidence labels carry the host, so
+cross-machine corroboration is visible in the apply surface.
+
+Every host is fail-soft and named: an unreachable machine, a key that needs a prompt, an
+unknown or changed host key, no Node, a Node below 22.5 (file-backed harnesses still
+work, the SQLite ones are named as skipped), or a missing git each produce one row in
+`backpass scan` and leave the rest of the run alone. Host keys are never auto-accepted
+and `StrictHostKeyChecking=no` is never suggested. Windows remotes are out of scope.
+`BACKPASS_SSH_BIN` overrides the ssh binary.
+
 ### One file instead of the whole surface
 
-`--target` narrows a run to one configured memory file or one skill, named exactly: a
-`memoryFiles` entry, or a skill's `name:`. Nothing else resolves - not a basename, a
-directory, a path to a SKILL.md, or an existing file the config does not name - and an
+`--target` narrows a run to one root memory file or one skill, named exactly: a
+`memoryFiles` entry, or a skill's `name:`. Nested memory files are trained only by a
+whole-surface run (see [Nested memory files](#10-nested-memory-files-in-a-monorepo)).
+Nothing else resolves - not a basename, a directory, a path to a SKILL.md, or an
+existing file the config does not name - and an
 unknown name fails, listing the valid ones, instead of falling back to the whole surface. A
 configured file that contains only an `@` import is rejected rather than rewritten or silently
 mapped to its import; the error names the imported memory file, which must itself be configured
@@ -195,6 +256,9 @@ Association runs in four tiers:
 4. **Tier 3 - best-effort.** A dead path whose last segment is the repo's directory name,
    or one matching a glob you configured. Labelled as such, and excluded by `--strict`.
 
+Configured SSH hosts are collected after the local stores and join the same corpus, with
+the same tiers, sample and cap - see [Your other machines](#your-other-machines).
+
 Collection is incremental. Codex alone can hold 10,000+ rollouts, so verdicts are cached in
 `.backpass/scan-cache.json` by path, mtime and size - re-scans cost only the new files.
 A harness whose store is missing or has drifted into an unrecognised shape produces a
@@ -259,10 +323,16 @@ orchestrating tool) - and the
 analysis is shown the ledger's open gaps so it can cite an existing gap id instead of
 coining a paraphrase of it.
 
-**Every claim must carry a verbatim quote.** Quoteless items are discarded - the single
-most important defence against a model confabulating influence. Negative evidence is
-weighted highest, but its class determines what it supports: non-compliance supports
-reinforcement, while only harm supports removal.
+**Every claim must carry a verbatim quote, and the quote must be in the trace.** Quoteless
+items are discarded - the single most important defence against a model confabulating
+influence - and so are quotes that do not actually appear in the distilled trace they claim
+to come from, compared whitespace-folded so the trace's line wrapping never rejects a real
+quote. A paraphrase is a claim without evidence. The check is skipped only when the analysis
+reports `usedRawTranscript`, because then the quote may legitimately come from text the
+distiller truncated or elided. When a run discards quotes this way it says so on stderr:
+a model that paraphrases instead of copying produces fewer findings, not cleaner ones.
+Negative evidence is weighted highest, but its class determines what it supports:
+non-compliance supports reinforcement, while only harm supports removal.
 
 To avoid smearing evidence across a large prose blob, backpass splits eligible prose
 paragraphs above 120 tokens at high-confidence sentence boundaries for attribution only.
@@ -335,8 +405,9 @@ A high-reasoning synthesis run turns the aggregated gradients into concrete edit
 REMOVE, REWRITE, EXTRACT→SKILL, or MOVE. The agent does not describe edits for backpass to
 splice in - it makes them, with its harness's own file tools, in a **staging copy** of the
 memory file and project skills under `.backpass/synthesis/` (the repo itself is read-only
-to it, for grounding). backpass then diffs the copy against the original and shows the agent the
-measured changes by id; the agent annotates each one with a title, rationale, and the
+to it, for grounding). Named nested files use their own staging copies and do not stage skills
+(see [Nested memory files](#10-nested-memory-files-in-a-monorepo)). backpass then diffs
+against the originals and shows the agent the measured changes by id; the agent annotates each one with a title, rationale, and the
 verbatim evidence behind it. Nothing textual is ever taken from the model: every hunk's
 text is copied out of your file by construction, so an edit can never "not appear" in it.
 Then mechanical gates run, and they are not negotiable:
@@ -366,7 +437,7 @@ Then mechanical gates run, and they are not negotiable:
 - a move's normalized removed and added line multisets match exactly, so it repositions
   text one-for-one without smuggling additions or triggering the harm floor
 - every edit carries a verbatim quote
-- the post-edit always-loaded surface must fit the budget, measured from the staged files
+- the post-edit always-loaded surface must fit the budget, or shrink if already over it, measured from the staged files
 
 An extraction is the `SKILL.md` (created, or an existing skill file that still carries
 every prior line plus the extracted ones) plus the memory-file change that pays for it.
@@ -412,9 +483,10 @@ pass optimizes under.
 **Default: 5,000 estimated tokens (~20KB)** for the always-loaded surface, configurable.
 The estimator is bytes/4 - harness-neutral, ±15%.
 
-The gated number is the **memory file plus every skill's `description:` line** - that is
-what an agent actually pays on every session. Skill bodies stay free until triggered and
-never compete for this budget. Every entry the harness loads counts, including one that is
+For the root file, the gated number is the **memory file plus every skill's
+`description:` line** - that is what an agent pays on every session. Named nested
+files have separate file-only budgets (see [Nested memory files](#10-nested-memory-files-in-a-monorepo)).
+Skill bodies stay free until triggered and never compete for the root budget. Every entry the harness loads counts, including one that is
 a symlink into a shared library: a harness loads what the path resolves to, so one library
 reached through several links is loaded - and billed - once per link, and an edit to its
 description line costs that many times its delta. (A repo that already carries many skills
@@ -511,8 +583,9 @@ backpass apply --dry-run   # show what would be written
 ### 9. Which file is the weights
 
 `memoryFiles` is an ordered list (default `["AGENTS.md", "CLAUDE.md"]`); the first one
-that exists is the file a run optimizes, so **AGENTS.md is canonical**. Resolution is
-pointer-aware:
+that exists is the root file a run optimizes, so **AGENTS.md is canonical**. Named
+[nested files](#10-nested-memory-files-in-a-monorepo) are additional weights, not
+separate root files. Resolution is pointer-aware:
 
 - `CLAUDE.md` containing only `@AGENTS.md` (the standard import) is a pointer: optimizing
   AGENTS.md covers both harness families and the pointer stays valid. Nothing to report.
@@ -526,12 +599,66 @@ pointer-aware:
   transcripts it is seeded from defaults alone and says so. Bootstrap only ever creates
   files; review it with `git diff`.
 
+### 10. Nested memory files in a monorepo
+
+A monorepo layers its memory: the root file loads in every session, and a file such as
+`apps/api/AGENTS.md` loads on top of it only when a session works under `apps/api/`. Name
+each nested file you want trained in `nestedMemoryFiles`. backpass never discovers one, so
+it never writes a file you did not name:
+
+```json
+{
+  "nestedMemoryFiles": ["apps/api/AGENTS.md", "apps/web/AGENTS.md"],
+  "nestedBudgetTokens": 2000
+}
+```
+
+With the list unset, a run is exactly the single-file run described above. With it set, a
+run over the whole surface trains each existing named file with analyzed sessions as a
+weight of its own; a missing file is reported, never created:
+
+- **Evidence per subtree.** Structured tool-call file paths (including apply_patch file
+  headers) locate work, resolved against the call's workdir or the session cwd. The cwd
+  alone locates work only when no structured paths exist; shell command text and a tool
+  workdir alone are not work paths. Paths outside this repository's known checkouts are
+  ignored: only in-repo paths define directory scope. A nested file is audited only
+  against sessions whose every in-repo work path stays under its directory. A session
+  editing `apps/api/src/orders.ts` that also reads `README.md` is cross-cutting and feeds
+  only the root file. The nested pass sees the root file and any named ancestor nested
+  files (outermost first) as already loaded, and keeps its own evidence, gap ledger, and
+  staging copy under `.backpass/nested/`. A change to any of those loaded files re-judges
+  the nested evidence. A session collected over ssh, or one with no in-repo work path,
+  is placed nowhere and feeds only the root file.
+- **Routing.** A new instruction belongs to the most specific named file whose directory
+  every session behind it worked in: a lesson from two `apps/api` sessions goes to
+  `apps/api/AGENTS.md`, and one seen in both `apps/api` and `apps/web` goes to the root.
+  The fold hands each file only the gap clusters it owns, and the proposal gate refuses an
+  addition in the wrong file. A rewrite or removal stays with the file whose text it
+  changes, and a failed skill trigger stays with the root, which owns the skill layer.
+- **A budget per file.** Each nested file is held to `nestedBudgetTokens` (`budgetTokens`
+  when unset), at propose and again at apply. An unchanged root over budget does not block
+  a combined proposal if at least one nested file actually runs synthesis with analyzed
+  evidence; if every nested file is skipped, the normal root shrink gate still applies.
+  Root edits must still clear that gate, and a nested edit must clear its own file's gate.
+  Skills belong to the root surface, so a nested run neither edits a skill nor extracts
+  into one.
+- **One review.** The proposal and `backpass apply` cover every file, each edit labeled
+  with its file and each nested file with its own budget. Apply refuses a saved nested
+  edit if that file is no longer named in the current config. The two-session evidence
+  floor, remembered rejections, and `apply` as the only writer are unchanged.
+
+Each nested directory keeps the pointer model above: name its canonical file, and a
+sibling `AGENTS.md` or `CLAUDE.md` that only imports it needs nothing, while a sibling
+with content of its own is warned about. An entry that is only a pointer is refused. A file listed in both
+`memoryFiles` and `nestedMemoryFiles` is nested. `--target` and `--memory-file` name
+exactly the files a run trains, so neither trains a nested file.
+
 ## CLI Reference
 
 | Command            | What it does                                                                             |
 | ------------------ | ---------------------------------------------------------------------------------------- |
 | `backpass`         | collect samples → calculate loss → aggregate gradients → gradient descent. Never writes. |
-| `backpass scan`    | collect samples only: the transcript table with a confidence column                      |
+| `backpass scan`    | collect samples only: the transcript table with host and confidence columns              |
 | `backpass analyze` | calculate loss: the tier-1 pass over pending transcripts                                 |
 | `backpass propose` | aggregate gradients + gradient descent: the tier-2 pass from cached evidence             |
 | `backpass apply`   | review and write the accepted edits                                                      |
@@ -544,8 +671,8 @@ Run `backpass --help` for the full flag list.
 
 On an interactive terminal the default run renders a live progress view: the budget gauge,
 a stage rail (collect samples → calculate loss → aggregate gradients → gradient descent),
-per-store collection counts, one lane
-per analysis job with its distillation receipt, and a running evidence tally. It draws to
+per-store and per-host collection counts, one lane per analysis job with its distillation
+receipt, and a running evidence tally. It draws to
 stderr only and collapses into the plain line summary when the run ends, so scrollback and
 piped output are identical to a run without it.
 
@@ -574,9 +701,13 @@ minutes for a cold-starting adapter; the remaining probe operations retain their
 durable verdicts are cached in
 `.backpass/agent-probe-cache.json` for 12h (30min for negatives). Pi and OpenCode entries
 are re-probed when their credential or auth-file state changes; `--force` re-probes every
-entry. The probe is a filter, not a promise: if the chosen harness answers `AUTH_REQUIRED`
-or rejects the model mid-run, backpass falls through to the next candidate and says so.
-When a whole ladder is exhausted the error lists every candidate with what to run to fix it.
+entry. The probe is a filter, not a promise: if the chosen harness answers `AUTH_REQUIRED`,
+rejects the model, or returns a clean exit with no output at all (a provider account out
+of quota or credits, often swallowed before it reaches stderr) mid-run, backpass falls
+through to the next candidate and says so. The one blank exit that never falls through is
+one that consumed the call's whole `--timeout` budget - that is acpx enforcing the timeout
+itself, and backpass reports it as a timeout, not a provider failure. When a whole ladder
+is exhausted the error lists every candidate with what to run to fix it.
 
 Bare model ids are resolved against what each adapter advertises (`openai-codex/gpt-5.6-luna`
 on pi, `openai/gpt-5.6-luna` on opencode, `gpt-5.6-luna` on codex), so nothing is hardcoded
@@ -611,7 +742,10 @@ CLI flags on top:
 {
   "memoryFiles": ["AGENTS.md"],
   "budgetTokens": 5000,
+  "nestedMemoryFiles": [],
+  "nestedBudgetTokens": null,
   "skillsDir": ".agents/skills",
+  "skillSearchPaths": [],
   "maxEditsPerRun": null,
   "minGapEvidence": 2,
   "gapLedgerMaxAge": "90d",
@@ -637,11 +771,26 @@ CLI flags on top:
     "since": "30d",
     "worktreeGlobs": [],
     "cloneRoots": [],
+    "hosts": [],
     "minUserTurns": 2
   },
   "jobs": 4
 }
 ```
+
+The `analysis` and `synthesis` blocks shown above are explicit project overrides. Omit a
+block to inherit that role from the global config; set its fields to `null` only when this
+repo should explicitly use the auto-pick ladder instead of a global pin. `backpass init`
+leaves both blocks out so it preserves either inherited behavior.
+
+Repositories initialized by a release that wrote all-null role blocks keep those explicit
+overrides when backpass is upgraded. To inherit a global pin there, remove the corresponding
+all-null `analysis` or `synthesis` block from `.backpassrc.json`, then confirm it with
+`backpass status`.
+
+`discovery.hosts` is the one setting a repo file may not carry; it belongs in the personal
+configuration file named above. In user scope it defaults to that file's top-level list,
+so you name your machines once.
 
 That example is the project scope. User scope ignores `.backpassrc.json` and instead
 layers the `"user"` block in `$XDG_CONFIG_HOME/backpass/config.json` (default
@@ -650,8 +799,24 @@ regular settings; its path and user-only settings include `memoryFiles`, `skills
 `skillsDirs`, `minGapProjects` (default `1`), and these discovery controls:
 
 `skillsDir` defaults to `.agents/skills`. To use an existing harness-loaded directory
-instead, such as `.claude/skills`, configure that path; a missing configured directory
-falls back to the default. Backpass normalizes path separators and trailing slashes.
+instead, such as `.claude/skills`, configure that path: use `--skills-dir <path>` for one
+run, `skillsDir` in `.backpassrc.json` for project scope, or `skillsDir` under the `user`
+block in `$XDG_CONFIG_HOME/backpass/config.json` (default `~/.config/backpass/config.json`)
+for user scope. A missing configured directory falls back to the default. Backpass leaves
+a real `.claude/skills` directory untouched and recommends manually merging new skill
+directories after checking for conflicts. It never recommends replacing that directory
+with a symlink. Backpass normalizes path separators and trailing slashes.
+
+`skillSearchPaths` lists additional directories to consult for _existing_ skills,
+alongside `skillsDir` and consulted after it in list order. `~` is expanded. Use it when
+your canonical skill library lives outside the repo - a machine-wide shared tree, or
+`~/.claude/skills` - so backpass recognizes those skills as already existing: an
+`AGENTS.md` reference into the shared tree is not treated as dangling, a failed trigger
+against a shared skill is reported as already covered instead of proposed as a duplicate
+(backpass cannot tune its description - the file stays read-only, in every scope), and an
+extraction whose content substantially matches a shared skill becomes a pointer edit
+rather than new content. This is read-only awareness: backpass never writes into a
+search path - every write still targets only `skillsDir`.
 
 ```json
 {
@@ -689,6 +854,7 @@ exclude (`.git/info/exclude`, written by `backpass init`) rather than the tracke
   agent-probe-cache.json which harnesses were available and logged in, and when
   rejections.json        edits you turned down, and the evidence behind them
   gap-ledger.json        gap sightings by gap and session, accumulated across runs
+  hosts/                 transcripts fetched from SSH hosts (mode 0700), pruned after 30 days unused
   apply/apply.html       the rendered review surface
 ```
 
@@ -698,12 +864,16 @@ For the user-scope state location and isolation contract, see
 ## Limitations
 
 - **Causal attribution is genuinely hard.** A model can confabulate influence. The
-  mitigations are structural - mandatory verbatim quotes, the two-session rule, negative
+  mitigations are structural - mandatory verbatim quotes checked against the trace they
+  claim to come from, the two-session rule, negative
   evidence weighted highest, and a human gate - but read the evidence, not just the title.
 - **Transcript formats are undocumented** and can change without notice. Each adapter is
   pinned by a golden fixture and fails soft.
 - **Cursor IDE is deferred to v1.1.** Its composer→workspace link is version-dependent;
   `--include-cursor-ide` enables a best-effort pass, but it is not a v1 guarantee.
+- **SSH collection is for your own machines.** Windows remotes are not supported, hosts
+  get no budget, cap, or window of their own, and pooling evidence across _people_ is a
+  different design - the vision's answer there is sharing derived evidence, not transcripts.
 - A project-scoped run never writes a user-level file. User-level edits are
   `--scope user` only (see [User-level memory](#user-level-memory)).
 - Paths are verified on macOS and Linux.
