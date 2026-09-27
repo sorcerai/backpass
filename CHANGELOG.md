@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.1.28](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.27...backpass-v0.1.28) (2026-09-25)
+
+
+### Bug Fixes
+
+* **redact:** stop secret redaction from eating benign tool arguments ([#153](https://github.com/kunchenguid/backpass/issues/153)) ([7bd9150](https://github.com/kunchenguid/backpass/commit/7bd9150cf281cb56fc8e7cae1441a7a7fd26f042))
+
+## [0.1.27](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.26...backpass-v0.1.27) (2026-09-24)
+
+
+### Bug Fixes
+
+* **acpx:** report acpx budget kills as timeouts, not empty-output ([#145](https://github.com/kunchenguid/backpass/issues/145)) ([b295a2d](https://github.com/kunchenguid/backpass/commit/b295a2d1d999fa5272e498176dd2cfce752e094b))
+
+## [0.1.26](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.25...backpass-v0.1.26) (2026-09-21)
+
+
+### Features
+
+* **config:** add skillSearchPaths for read-only awareness of shared skill libraries ([#138](https://github.com/kunchenguid/backpass/issues/138)) ([2bade32](https://github.com/kunchenguid/backpass/commit/2bade325f15b0fb0ed087245e045a6979961f738))
+
+## [0.1.25](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.24...backpass-v0.1.25) (2026-09-18)
+
+
+### Bug Fixes
+
+* **skills:** preserve real Claude skills directories ([#136](https://github.com/kunchenguid/backpass/issues/136)) ([158dcd6](https://github.com/kunchenguid/backpass/commit/158dcd6343291d90f4eb3119402aa58dcf128326))
+
+## [0.1.24](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.23...backpass-v0.1.24) (2026-09-16)
+
+
+### Bug Fixes
+
+* **config:** preserve global agent pins after init ([#137](https://github.com/kunchenguid/backpass/issues/137)) ([7d92241](https://github.com/kunchenguid/backpass/commit/7d922418138ea7089c5469130fa94ecbde2e87b4))
+
+## [0.1.23](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.22...backpass-v0.1.23) (2026-09-16)
+
+
+### Bug Fixes
+
+* **acpx:** stop discarding stderr on empty-output classification ([#131](https://github.com/kunchenguid/backpass/issues/131)) ([4f5a684](https://github.com/kunchenguid/backpass/commit/4f5a684a4f3130ab5676b1ba26ec9928eca92287))
+* **apply:** compare skillsDir by resolved logical path and drop placeholder failure locations ([#133](https://github.com/kunchenguid/backpass/issues/133)) ([dc4124d](https://github.com/kunchenguid/backpass/commit/dc4124d342d18a4ea523483eb3bdd7d0c693424c))
+* **synthesize:** count stray edit-turn writes as touched ([#132](https://github.com/kunchenguid/backpass/issues/132)) ([dbaeced](https://github.com/kunchenguid/backpass/commit/dbaeced54538bb5bdd8e27c59f5eb8307e4f1109))
+
+## [0.1.22](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.21...backpass-v0.1.22) (2026-09-13)
+
+
+### Features
+
+* **discovery:** collect sessions from remote machines over SSH ([#124](https://github.com/kunchenguid/backpass/issues/124)) ([fa712a0](https://github.com/kunchenguid/backpass/commit/fa712a07e928ae392f1c489788387a3fe4724e81))
+
+## [0.1.21](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.20...backpass-v0.1.21) (2026-09-12)
+
+
+### Bug Fixes
+
+* **acpx:** fall through the agent ladder on clean-exit empty output ([#122](https://github.com/kunchenguid/backpass/issues/122)) ([764ed95](https://github.com/kunchenguid/backpass/commit/764ed9551ec68dc88b7b6a424e028d1a4c122b29))
+
+## [0.1.20](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.19...backpass-v0.1.20) (2026-09-10)
+
+
+### Bug Fixes
+
+* **analyze:** discard evidence quotes that do not appear in the distilled trace ([#118](https://github.com/kunchenguid/backpass/issues/118)) ([7d171f7](https://github.com/kunchenguid/backpass/commit/7d171f750003fb7921824c88a652ed766aff83ce))
+
+## [0.1.19](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.18...backpass-v0.1.19) (2026-09-07)
+
+
+### Bug Fixes
+
+* **skills:** see and stage skills that are symlinked into the loaded directory ([#113](https://github.com/kunchenguid/backpass/issues/113)) ([4e67dcd](https://github.com/kunchenguid/backpass/commit/4e67dcd7e3d5e17f9fb84deee45d65d4763de954))
+
 ## [0.1.18](https://github.com/kunchenguid/backpass/compare/backpass-v0.1.17...backpass-v0.1.18) (2026-09-04)
 
 
