@@ -105,7 +105,7 @@ export class ProposalViolation extends Error {
   }
 }
 
-function normalizeEdit(raw, index, knownSources = null) {
+function normalizeEdit(raw, index, knownSources = null, sourceObservers = null) {
   const kind = String(raw?.kind || "").toLowerCase();
   const refs = Array.isArray(raw?.changes) ? raw.changes : Array.isArray(raw?.hunks) ? raw.hunks : [];
   const normalizedEvidence = normalizeEvidence(raw?.evidence);
@@ -122,9 +122,9 @@ function normalizeEdit(raw, index, knownSources = null) {
     instructions: Array.isArray(raw?.instructions) ? raw.instructions.map(String) : [],
     evidence,
     // Corroboration is measured from the edit's normalized quotes, never from a
-    // model-reported count. When the fold handed over this run's source labels,
-    // only those labels count - a typed-but-never-issued source is not a session.
-    transcripts: countSources(normalizedEvidence, knownSources),
+    // model-reported count. Fold-issued labels admit citations; `sourceObservers`
+    // collapses related native transcripts before counting independent observers.
+    transcripts: countSources(normalizedEvidence, knownSources, sourceObservers),
   };
 }
 
@@ -139,11 +139,12 @@ function normalizeEvidence(evidence) {
     }));
 }
 
-function countSources(evidence, known = null) {
+function countSources(evidence, known = null, observers = null) {
   if (!Array.isArray(evidence)) return 0;
-  const labels = new Set(evidence.map((e) => normalizeSourceLabel(e?.source)).filter(Boolean));
-  if (!known) return labels.size;
-  return [...labels].filter((label) => known.has(label)).length;
+  const labels = [...new Set(evidence.map((e) => normalizeSourceLabel(e?.source)).filter(Boolean))];
+  const admitted = known ? labels.filter((label) => known.has(label)) : labels;
+  if (!observers) return admitted.length;
+  return new Set(admitted.flatMap((label) => [observers[label]].flat().filter(Boolean))).size;
 }
 
 /** The del-line texts of a hunk that are not carried by `lineCounts` (blank lines ignored). */
@@ -298,18 +299,52 @@ export function renderChangesForPrompt(measured, memoryFile) {
     .join("\n\n");
 }
 
+function evidenceQuoteKey(item) {
+  return `${item.source || ""}\n${item.text || ""}`;
+}
+
+function ledgerIdsOfGap(gap) {
+  if (Array.isArray(gap?.ids) && gap.ids.length) return gap.ids.map(String).filter(Boolean);
+  return gap?.id ? [String(gap.id)] : [];
+}
+
 /**
- * Validate the annotated, measured changes against the mechanical gates. Returns
- * `{ proposal, violations }`; the caller decides whether to re-prompt or fail loudly.
- *
- * `context.measured` is the workspace measurement (`measureWorkspace`); `rawResult` is
- * the model's annotation. Nothing textual is taken from the model: the hunks, their
- * deltas, the projected budget, and even whether an edit is an addition are measured.
+ * Ledger ids for gap clusters whose catalog quotes uniquely match this edit's evidence.
+ * Exact `source + text` against `summary.gaps` quotes - the same join
+ * `countedEvidenceProjects` uses. A quote that hits two clusters is not unique and is
+ * skipped, so a shared sentence cannot weld two gaps into one suppression identity.
  */
+function uniqueMatchingGapIds(edit, summary) {
+  const ids = new Set();
+  for (const item of edit.evidence || []) {
+    const key = evidenceQuoteKey(item);
+    const matching = (summary?.gaps || []).filter((gap) =>
+      (gap.quotes || []).some((quote) => evidenceQuoteKey(quote) === key),
+    );
+    if (matching.length !== 1) continue;
+    for (const id of ledgerIdsOfGap(matching[0])) ids.add(id);
+  }
+  return [...ids];
+}
+
+/**
+ * Content hashes of the instruction units the memory-file hunks actually touch, using the
+ * same range intersection as removal evidence. Positional aliases shift whenever a unit
+ * is added above, so they never persist. Annotate `instructions` never widen this set.
+ */
+function measuredInstructionIds(memoryHunks, memoryFile) {
+  const measured = new Set();
+  if (!memoryFile?.units) return [];
+  for (const hunk of memoryHunks) {
+    for (const unit of unitsRemovedBy(hunk, memoryFile)) measured.add(unit.hash);
+  }
+  return [...measured];
+}
+
 function countedEvidenceProjects(edit, summary) {
-  const quoted = new Set(edit.evidence.map((item) => `${item.source || ""}\n${item.text || ""}`));
+  const quoted = new Set(edit.evidence.map((item) => evidenceQuoteKey(item)));
   const byGap = (summary?.gaps || [])
-    .filter((gap) => gap.quotes?.some((quote) => quoted.has(`${quote.source || ""}\n${quote.text || ""}`)))
+    .filter((gap) => gap.quotes?.some((quote) => quoted.has(evidenceQuoteKey(quote))))
     .map((gap) => gap.projects || 0);
   // Gap clusters carry their own project count, but an edit that rewrites or reinforces
   // an existing instruction quotes instruction-row evidence, which carries none. The fold
@@ -323,6 +358,14 @@ function countedEvidenceProjects(edit, summary) {
   return Math.max(0, byQuoteSource.size, ...byGap);
 }
 
+/**
+ * Validate the annotated, measured changes against the mechanical gates. Returns
+ * `{ proposal, violations }`; the caller decides whether to re-prompt or fail loudly.
+ *
+ * `context.measured` is the workspace measurement (`measureWorkspace`); `rawResult` is
+ * the model's annotation. Nothing textual is taken from the model: the hunks, their
+ * deltas, the projected budget, and even whether an edit is an addition are measured.
+ */
 export function buildProposal(rawResult, context) {
   const {
     memoryFile,
@@ -345,7 +388,7 @@ export function buildProposal(rawResult, context) {
   const knownSources = Array.isArray(summary?.sources)
     ? new Set(summary.sources.map(normalizeSourceLabel).filter(Boolean))
     : null;
-  const edits = rawEdits.map((raw, i) => normalizeEdit(raw, i, knownSources));
+  const edits = rawEdits.map((raw, i) => normalizeEdit(raw, i, knownSources, summary?.sourceObservers));
   const changesById = new Map(measured.changes.map((c) => [c.id, c]));
 
   // Skill description lines are always loaded, so they sit under the same cap as the
@@ -591,13 +634,17 @@ export function buildProposal(rawResult, context) {
     if (routing && !preservesAlwaysLoaded(edit.kind) && hunks.some((h) => h.added > 0 && h.removed === 0)) {
       const sessions = [
         ...new Set(
-          edit.evidence.map((item) => summary?.sourceSessions?.[normalizeSourceLabel(item.source)]).filter(Boolean),
+          edit.evidence
+            .flatMap((item) => [summary?.sourceSessions?.[normalizeSourceLabel(item.source)]].flat())
+            .filter(Boolean),
         ),
       ];
-      const sightings = edit.evidence.map((item) => ({
-        sessionId: summary?.sourceSessions?.[normalizeSourceLabel(item.source)],
-        quote: item.text,
-      }));
+      const sightings = edit.evidence.flatMap((item) =>
+        [summary?.sourceSessions?.[normalizeSourceLabel(item.source)]]
+          .flat()
+          .filter(Boolean)
+          .map((sessionId) => ({ sessionId, quote: item.text })),
+      );
       const owner = rootOwnsGap(sightings, routing.rootOwnedGaps)
         ? routing.rootPath
         : (routing.ownerOf(sessions) ?? routing.rootPath);
@@ -671,6 +718,8 @@ export function buildProposal(rawResult, context) {
       title: edit.title,
       rationale: edit.rationale,
       instructions: edit.instructions,
+      gapIds: uniqueMatchingGapIds(edit, summary),
+      instructionIds: measuredInstructionIds(memoryHunks, memoryFile),
       evidence: edit.evidence,
       transcripts: edit.transcripts,
       ...(evidenceProjects != null ? { projects: evidenceProjects } : {}),

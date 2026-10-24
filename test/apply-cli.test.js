@@ -6,7 +6,9 @@ import path from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { applyDecisions } from "../src/apply/writer.js";
 import { buildProposal } from "../src/proposal.js";
+import { State } from "../src/state.js";
 import { stageAndMeasure } from "./helpers/staging.js";
 
 /**
@@ -73,10 +75,10 @@ const sectionBody = (text, heading) => new RegExp(`(?<=## ${heading}\\n\\n)[\\s\
  * the measured changes. No model is involved and nothing textual is invented - the
  * hunks are cut from the file, exactly as in production.
  */
-function proposeExtractions(dir) {
+function proposeExtractions(dir, { budgetTokens = 5000 } = {}) {
   const repo = { root: dir, realRoot: dir, name: path.basename(dir), worktrees: [dir], remotes: [] };
   const config = {
-    budgetTokens: 5000,
+    budgetTokens,
     maxEditsPerRun: 20,
     minGapEvidence: 2,
     skillsDir: ".agents/skills",
@@ -597,8 +599,8 @@ test("a memory write failure rolls back skills without truncating memory", () =>
 
 test("apply names a memory file left over budget without refusing the shrink", () => {
   const dir = initRepo();
-  const proposal = proposeExtractions(dir);
   // A cap this small cannot be met in one pass; the run is still legitimate progress.
+  const proposal = proposeExtractions(dir, { budgetTokens: 20 });
   fs.writeFileSync(path.join(dir, ".backpassrc.json"), JSON.stringify({ budgetTokens: 20 }));
 
   const applied = runApply(
@@ -610,6 +612,76 @@ test("apply names a memory file left over budget without refusing the shrink", (
   assert.match(applied.output, /wrote AGENTS\.md/);
   assert.match(applied.output, /is still \d+ tokens over the 20-token budget/);
   assert.match(applied.output, /run `backpass` again for the next shrink step/);
+});
+
+test("apply refuses a proposal made under a different budget, naming both numbers and the remedy", () => {
+  for (const [made, configured] of [
+    [30000, 10000],
+    [20, 5000],
+  ]) {
+    const dir = initRepo();
+    const proposal = proposeExtractions(dir, { budgetTokens: made });
+    fs.writeFileSync(path.join(dir, ".backpassrc.json"), JSON.stringify({ budgetTokens: configured }));
+    git(["add", "-A"], dir);
+    git(["commit", "-qm", "config"], dir);
+    const before = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    const applied = runDecided(dir, proposal.edits.map((e) => `${e.id}=accepted`).join(" "));
+
+    assert.equal(applied.status, 1, `a budget mismatch must refuse the apply:\n${applied.output}`);
+    assert.match(
+      applied.output,
+      new RegExp(
+        `this proposal was made under a ${made.toLocaleString("en-US")}-token budget for AGENTS\\.md; ` +
+          `the current config says ${configured.toLocaleString("en-US")}`,
+      ),
+    );
+    assert.match(applied.output, new RegExp(`re-run apply with --budget ${made},`));
+    assert.equal(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8"), before);
+    assert.equal(porcelain(dir), "", "nothing was written");
+    assert.deepEqual(rejectionsOf(dir), {});
+  }
+});
+
+test("the writer itself refuses accepted root edits made under a different budget", () => {
+  // `cmdApply` refuses first; the writer, as owner of every write gate, must hold on its own.
+  const dir = initRepo();
+  const proposal = proposeExtractions(dir, { budgetTokens: 30000 });
+  const [accepted, rejected] = proposal.edits;
+  const before = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+  const results = applyDecisions({
+    proposal,
+    decisions: { [accepted.id]: "accepted", [rejected.id]: "rejected" },
+    repo: { root: dir, realRoot: dir, name: path.basename(dir), worktrees: [dir], remotes: [] },
+    state: new State(dir).ensure(),
+    config: { budgetTokens: 10000, skillsDir: ".agents/skills" },
+  });
+
+  assert.deepEqual(results.written, []);
+  assert.equal(results.rejectionsRecorded, false);
+  assert.deepEqual(
+    results.failed.map((failure) => failure.error),
+    [
+      "this proposal was made under a 30,000-token budget for AGENTS.md; the current config says 10,000; " +
+        "re-run apply with --budget 30000, or run `backpass` again to propose under the current budget",
+    ],
+  );
+  assert.equal(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8"), before);
+  assert.equal(fs.existsSync(path.join(dir, ".agents")), false, "no skill was written");
+  assert.deepEqual(rejectionsOf(dir), {});
+});
+
+test("apply under the budget the proposal was made under gates at that budget", () => {
+  const dir = initRepo();
+  const proposal = proposeExtractions(dir, { budgetTokens: 30000 });
+  fs.writeFileSync(path.join(dir, ".backpassrc.json"), JSON.stringify({ budgetTokens: 10000 }));
+
+  const applied = runDecided(dir, proposal.edits.map((e) => `${e.id}=accepted`).join(" "), ["--budget", "30000"]);
+
+  assert.equal(applied.status, 0, `the named remedy must apply:\n${applied.output}`);
+  assert.match(applied.output, /wrote AGENTS\.md/);
+  assert.match(applied.output, /\/ 30,000 tok/);
 });
 
 test("a skillsDir mismatch failure prints its message without a placeholder location", () => {
@@ -625,4 +697,142 @@ test("a skillsDir mismatch failure prints its message without a placeholder loca
   assert.equal(applied.status, 1, `a skillsDir mismatch must refuse the apply:\n${applied.output}`);
   assert.doesNotMatch(applied.output, /undefined/, "a run-level failure must not print a placeholder location");
   assert.match(applied.output, /this proposal was generated with skillsDir=/);
+});
+
+/** `backpass apply --decisions`, with no terminal and no review surface to fall back on. */
+function runDecided(dir, vector, extraArgs = []) {
+  const result = spawnSync(process.execPath, [CLI, "apply", "--decisions", vector, ...extraArgs], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1", BACKPASS_LAVISH_BIN: path.join(dir, "no-such-lavish") },
+  });
+  return { ...result, output: `${result.stdout}${result.stderr}` };
+}
+
+function rejectionsOf(dir) {
+  const file = path.join(dir, ".backpass", "rejections.json");
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).entries : {};
+}
+
+test("--decisions writes accepted edits and remembers a rejection with its reason", () => {
+  const dir = initRepo();
+  const [accepted, rejected] = proposeExtractions(dir).edits;
+
+  const applied = runDecided(dir, `${accepted.id}=accepted ${rejected.id}=rejected:too-narrow`);
+
+  assert.equal(applied.status, 0, `apply should succeed:\n${applied.output}`);
+  assert.match(applied.output, /1 accepted · 1 rejected/);
+  const memory = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.match(memory, /- Load `ci-details` for this topic\./);
+  assert.doesNotMatch(memory, /release-details/);
+  assert.equal(fs.existsSync(path.join(dir, ".agents/skills/release-details")), false);
+  assert.deepEqual(
+    Object.values(rejectionsOf(dir)).map((entry) => [entry.title, entry.reason]),
+    [[rejected.title, "too-narrow"]],
+  );
+});
+
+test("repeated --decisions apply one combined vector and preserve reject reasons", () => {
+  for (const [first, second] of [
+    ["e1=accepted", "e2=rejected:too-narrow"],
+    ["e2=rejected:too-narrow", "e1=accepted"],
+  ]) {
+    const dir = initRepo();
+    const [, rejected] = proposeExtractions(dir).edits;
+
+    const applied = runDecided(dir, first, ["--decisions", second]);
+
+    assert.equal(applied.status, 0, applied.output);
+    assert.match(applied.output, /1 accepted · 1 rejected/);
+    const memory = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+    assert.match(memory, /- Load `ci-details` for this topic\./);
+    assert.doesNotMatch(memory, /release-details/);
+    assert.equal(fs.existsSync(path.join(dir, ".agents/skills/ci-details/SKILL.md")), true);
+    assert.equal(fs.existsSync(path.join(dir, ".agents/skills/release-details")), false);
+    assert.deepEqual(
+      Object.values(rejectionsOf(dir)).map((entry) => [entry.title, entry.reason]),
+      [[rejected.title, "too-narrow"]],
+    );
+  }
+});
+
+test("--decisions leaves an edit it does not name undecided", () => {
+  const dir = initRepo();
+  const [unnamed, accepted] = proposeExtractions(dir).edits;
+
+  const applied = runDecided(dir, `${accepted.id}=accepted`);
+
+  assert.equal(applied.status, 0, `apply should succeed:\n${applied.output}`);
+  const memory = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+  assert.match(memory, /- Load `release-details` for this topic\./);
+  assert.doesNotMatch(memory, /ci-details/, `${unnamed.id} was never decided`);
+  assert.deepEqual(rejectionsOf(dir), {}, "an undecided edit is not a rejection");
+});
+
+test("a --decisions vector that does not decide cleanly writes nothing", () => {
+  const dir = initRepo();
+  proposeExtractions(dir);
+  const memory = path.join(dir, "AGENTS.md");
+  const before = fs.readFileSync(memory, "utf8");
+
+  for (const { vector, message } of [
+    { vector: "e1=accepted e9=rejected", message: /e9 is not an edit of this proposal/ },
+    { vector: "e1=acepted", message: /"e1=acepted" is not <edit>=accepted or <edit>=rejected\[:<reason>\]/ },
+    { vector: "e1=rejected:nope", message: /carries a reason that is not a reject reason/ },
+    { vector: "e1=accepted:disagree", message: /carries a reason that is not a reject reason/ },
+    { vector: "e1=accepted e1=rejected", message: /e1 is decided twice/ },
+    { vector: " ", message: /--decisions names no edit/ },
+  ]) {
+    const applied = runDecided(dir, vector);
+    assert.equal(applied.status, 1, `${vector}:\n${applied.output}`);
+    assert.match(applied.output, message, vector);
+    assert.equal(fs.readFileSync(memory, "utf8"), before, vector);
+    assert.equal(porcelain(dir), "", vector);
+    assert.deepEqual(rejectionsOf(dir), {}, vector);
+  }
+
+  const both = runDecided(dir, "e1=accepted", ["--no-ui"]);
+  assert.equal(both.status, 1, both.output);
+  assert.match(both.output, /--decisions and --no-ui both decide the edits/);
+  assert.equal(fs.readFileSync(memory, "utf8"), before);
+});
+
+test("repeated --decisions validate every vector before writing anything", () => {
+  for (const { first, second, message } of [
+    { first: "e1=acepted", second: "e2=accepted", message: /"e1=acepted" is not <edit>=accepted/ },
+    { first: "e1=accepted", second: "e2=acepted", message: /"e2=acepted" is not <edit>=accepted/ },
+    { first: "e9=rejected", second: "e2=accepted", message: /e9 is not an edit of this proposal/ },
+    { first: "e1=rejected:nope", second: "e2=accepted", message: /carries a reason that is not a reject reason/ },
+    { first: "e1=accepted", second: "e1=accepted", message: /e1 is decided twice/ },
+    { first: "e1=accepted", second: "e1=rejected:too-narrow", message: /e1 is decided twice/ },
+    { first: "e1=rejected:too-narrow", second: "e1=accepted", message: /e1 is decided twice/ },
+    { first: " ", second: " ", message: /--decisions names no edit/ },
+    { first: " ", second: "e1=accepted", message: /--decisions names no edit/ },
+    { first: "e1=accepted", second: "", message: /--decisions names no edit/ },
+  ]) {
+    const dir = initRepo();
+    proposeExtractions(dir);
+    const proposalFile = path.join(dir, ".backpass", "proposal.json");
+    const before = fs.readFileSync(proposalFile, "utf8");
+
+    const applied = runDecided(dir, first, ["--decisions", second]);
+
+    assert.equal(applied.status, 1, applied.output);
+    assert.match(applied.output, message);
+    assert.equal(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8"), MEMORY_TEXT);
+    assert.equal(porcelain(dir), "");
+    assert.deepEqual(rejectionsOf(dir), {});
+    assert.equal(fs.readFileSync(proposalFile, "utf8"), before, "the saved proposal is unchanged");
+  }
+});
+
+test("--decisions belongs to apply alone", () => {
+  const dir = initRepo();
+  const result = spawnSync(process.execPath, [CLI, "status", "--decisions", "e1=accepted"], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`);
+  assert.match(`${result.stdout}${result.stderr}`, /--decisions does not apply to status/);
 });

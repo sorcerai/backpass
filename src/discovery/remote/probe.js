@@ -72,7 +72,9 @@ async function descriptorFrom(adapter, row, id) {
   const content = adapter.sqliteBacked ? await adapter.read(row) : null;
   const contentSignature = content ? eventSignature(content) : null;
   const firstUser = content?.events?.find((event) => event?.kind === "message" && event.role === "user");
-  const self = typeof firstUser?.text === "string" && firstUser.text.startsWith(SELF_SESSION_SENTINEL);
+  // An explicit store-level decision includes openings omitted by normalized events
+  // (for example attachment-only OpenCode messages). Only fall back when it is absent.
+  const self = row.self ?? (typeof firstUser?.text === "string" && firstUser.text.startsWith(SELF_SESSION_SENTINEL));
   return {
     self,
     descriptor: {
@@ -87,6 +89,9 @@ async function descriptorFrom(adapter, row, id) {
       remotes: Array.isArray(row.remotes) ? row.remotes : [],
       title: row.title || null,
       startedAt: row.startedAt || null,
+      parentSessionId: row.parentSessionId,
+      parentSessionPath: row.parentSessionPath,
+      parentSessionStartedAt: row.parentSessionStartedAt,
       mtimeMs: row.mtimeMs || 0,
       bytes: row.bytes || 0,
       contentSignature,
@@ -99,7 +104,7 @@ async function descriptorFrom(adapter, row, id) {
   };
 }
 
-async function discoverHarness(adapter, { cutoffMs }) {
+async function discoverHarness(adapter, { cutoffMs, includeOmp }) {
   const stats = { scanned: 0, classified: 0, self: 0, error: null };
   const out = [];
   const warnings = [];
@@ -122,10 +127,12 @@ async function discoverHarness(adapter, { cutoffMs }) {
     return { stats, descriptors: out, warnings };
   }
 
-  for (const candidate of adapter.enumerate({ cutoffMs })) {
+  const candidates = adapter.enumerate({ cutoffMs, config: { discovery: { includeOmp } } });
+  const scanContext = adapter.createScanContext?.();
+  for (const candidate of candidates) {
     if (cutoffMs && candidate.mtimeMs < cutoffMs) continue;
     stats.scanned += 1;
-    const classified = adapter.classify(candidate);
+    const classified = adapter.classify(candidate, { scanContext });
     if (!classified) continue;
     stats.classified += 1;
     const merged = { ...candidate, ...classified };
@@ -155,8 +162,8 @@ async function discoverHarness(adapter, { cutoffMs }) {
   return { stats, descriptors: out, warnings };
 }
 
-/** @param {{ harnesses?: string[], cutoffMs?: number | null }} request */
-export async function discover({ harnesses = [], cutoffMs = null } = {}) {
+/** @param {{ harnesses?: string[], cutoffMs?: number | null, includeOmp?: boolean }} request */
+export async function discover({ harnesses = [], cutoffMs = null, includeOmp = false } = {}) {
   const harnessStats = Object.create(null);
   const descriptors = [];
   const warnings = [];
@@ -174,7 +181,7 @@ export async function discover({ harnesses = [], cutoffMs = null } = {}) {
       continue;
     }
     try {
-      const result = await discoverHarness(adapter, { cutoffMs });
+      const result = await discoverHarness(adapter, { cutoffMs, includeOmp });
       harnessStats[harness] = result.stats;
       descriptors.push(...result.descriptors);
       warnings.push(...result.warnings);

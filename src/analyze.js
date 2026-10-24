@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { extractJson, runModelCall, usageRecord } from "./acpx.js";
 import { distill } from "./distill.js";
 import { classifyInteraction } from "./interaction.js";
-import { readTranscript } from "./discovery/index.js";
+import { getAdapter, readTranscript } from "./discovery/index.js";
 import { instructionUnits, renderInstructionIndex } from "./memory.js";
 import { renderSkillIndexForAnalysis } from "./skills.js";
 import { renderPrompt } from "./prompts.js";
@@ -12,7 +13,7 @@ import { renderOpenGapIndex } from "./gap-ledger.js";
 import { evidenceKey, isEvidenceFresh, safeFileName } from "./state.js";
 import { emitProgress } from "./progress.js";
 import { UserError, color, info, warn } from "./logger.js";
-import { transcriptIdentity } from "./transcript.js";
+import { corroborationIdentityOf, transcriptIdentity } from "./transcript.js";
 
 /**
  * Stage 1 of the pipeline (design section 3): one cheap model call per transcript,
@@ -29,6 +30,95 @@ const MIN_TOOL_CALLS = 3;
 
 let callCounter = 0;
 const seenNotes = new Set();
+const activeRawFiles = new Set();
+
+/**
+ * A raw file is leased rather than owned by a PID: while its call runs, this process renews
+ * the file's modification time every minute. Reclaim only after 24 hours without renewal,
+ * allowing hours of clock skew between hosts sharing state while making SIGKILL leftovers
+ * eligible for cleanup after a day. PIDs cannot prove liveness across hosts or namespaces.
+ */
+const RAW_LEASE_RENEW_MS = 60_000;
+const RAW_LEASE_MS = 24 * 60 * 60_000;
+const RAW_FILE_NAME = /^[0-9a-f-]{36}\.jsonl$/;
+let leaseTimer = null;
+
+process.once("exit", () => {
+  for (const file of activeRawFiles) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch (err) {
+      warn(`could not remove raw transcript ${file}: ${err.message}`);
+    }
+  }
+});
+
+function renewRawLeases() {
+  const now = new Date();
+  for (const file of activeRawFiles) {
+    try {
+      fs.utimesSync(file, now, now);
+    } catch {
+      // Not written yet, or already removed; either way there is no lease to renew.
+    }
+  }
+}
+
+function holdRawFile(file) {
+  activeRawFiles.add(file);
+  if (!leaseTimer) {
+    leaseTimer = setInterval(renewRawLeases, RAW_LEASE_RENEW_MS);
+    leaseTimer.unref();
+  }
+}
+
+function releaseRawFile(file) {
+  activeRawFiles.delete(file);
+  if (!activeRawFiles.size && leaseTimer) {
+    clearInterval(leaseTimer);
+    leaseTimer = null;
+  }
+  fs.rmSync(file, { force: true });
+}
+
+/** Housekeeping is best-effort: skip an inaccessible directory with one warning. */
+function rawCleanupEntries(dir) {
+  try {
+    const stat = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (!stat) return []; // Optional directory has not been created.
+    if (!stat.isDirectory()) throw new Error("not a directory");
+    return fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    warn(`could not reclaim raw transcripts in ${dir}: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Removes raw files whose lease expired - what an uncatchable exit such as SIGKILL leaves
+ * behind - from the state root and its nested state directories.
+ */
+export function reclaimExpiredRawFiles(stateRoot) {
+  if (!stateRoot) return;
+  const now = Date.now();
+  const roots = [stateRoot];
+  const nested = path.join(stateRoot, "nested");
+  for (const entry of rawCleanupEntries(nested)) {
+    if (entry.isDirectory()) roots.push(path.join(nested, entry.name));
+  }
+  for (const root of roots) {
+    const dir = path.resolve(root, "raw");
+    for (const entry of rawCleanupEntries(dir)) {
+      const file = path.join(dir, entry.name);
+      if (!entry.isFile() || !RAW_FILE_NAME.test(entry.name)) continue;
+      try {
+        if (now - fs.statSync(file).mtimeMs > RAW_LEASE_MS) fs.rmSync(file, { force: true });
+      } catch {
+        // Removed by its own run in the meantime.
+      }
+    }
+  }
+}
 
 /** The same adapter limitation would repeat once per transcript; say it once per run. */
 function noteOnce(note) {
@@ -141,6 +231,19 @@ function promptPathFor(state, transcript) {
   return path.join(state.applyDir, "..", "prompts", `${safeFileName(transcriptIdentity(transcript))}.md`);
 }
 
+/**
+ * The raw-transcript escape hatch must open one session, not expose a shared database
+ * or require queries against an undocumented schema. File-backed sessions and remote
+ * cached copies already have session-specific paths; local SQLite sessions need a
+ * temporary export here. See README.md's Distill section for its lifecycle.
+ *
+ * @returns {string | null}
+ */
+function sessionRawPath(transcript, state) {
+  if (transcript.host || !getAdapter(transcript.harness)?.sqliteBacked || !state?.root) return null;
+  return path.resolve(state.root, "raw", `${randomUUID()}.jsonl`);
+}
+
 async function analyzeOne({
   transcript,
   memoryFile,
@@ -153,10 +256,11 @@ async function analyzeOne({
   alsoLoaded = "",
 }) {
   const raw = await readTranscript(transcript);
+  const rawFile = sessionRawPath(transcript, config.state);
   const distilled = distill(raw.events, {
     ...transcript,
     model: raw.model,
-    rawPath: raw.rawPath,
+    rawPath: rawFile ?? raw.rawPath,
   });
 
   emitProgress("analyze:lane", {
@@ -184,68 +288,101 @@ async function analyzeOne({
     };
   }
 
-  const prompt = renderPrompt("analysis", {
-    MEMORY_PATH: memoryFile.path,
-    INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
-    ALSO_LOADED: alsoLoaded,
-    SKILLS: skillIndex,
-    OPEN_GAPS: openGapIndex,
-    TRACE: distilled.trace,
-  });
+  try {
+    if (rawFile) {
+      fs.mkdirSync(path.dirname(rawFile), { recursive: true, mode: 0o700 });
+      const lines = [
+        JSON.stringify({ harness: transcript.harness, session: transcript.nativeId, model: raw.model || null }),
+        ...raw.events.map((event) => JSON.stringify(event)),
+      ];
+      holdRawFile(rawFile);
+      fs.writeFileSync(rawFile, `${lines.join("\n")}\n`, { mode: 0o600, flag: "wx" });
+    }
 
-  const promptFile = promptPathFor(config.state, transcript);
-  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
-  fs.writeFileSync(promptFile, prompt);
-
-  let ranWith = null;
-  const result = await config.agents.withFallthrough("analysis", async (pick) => {
-    ranWith = pick.agent;
-    const call = {
-      agent: pick.agent,
-      model: pick.model,
-      promptFile,
-      cwd: modelCwd || repo.root,
-      timeoutSeconds: config.timeoutSeconds,
-      promptRetries: config.promptRetries,
-    };
-    // Route effortful calls through a fresh per-transcript session so each harness's
-    // invocation-scoped overlay or safe fallback is applied; otherwise one-shot is cheaper.
-    return runModelCall(call, pick, {
-      sessionName: () => `backpass-analysis-${process.pid}-${slot}-${++callCounter}`,
+    const prompt = renderPrompt("analysis", {
+      MEMORY_PATH: memoryFile.path,
+      INSTRUCTION_INDEX: renderInstructionIndex(memoryFile),
+      ALSO_LOADED: alsoLoaded,
+      SKILLS: skillIndex,
+      OPEN_GAPS: openGapIndex,
+      TRACE: distilled.trace,
     });
-  });
-  for (const note of result.notes || []) noteOnce(note);
 
-  const parsed = extractJson(result.text);
-  if (!parsed) {
-    throw new Error("analysis returned no parseable JSON");
+    const promptFile = promptPathFor(config.state, transcript);
+    fs.mkdirSync(path.dirname(promptFile), { recursive: true });
+    fs.writeFileSync(promptFile, prompt);
+
+    let ranWith = null;
+    const result = await config.agents.withFallthrough("analysis", async (pick) => {
+      ranWith = pick.agent;
+      const call = {
+        agent: pick.agent,
+        model: pick.model,
+        promptFile,
+        cwd: modelCwd || repo.root,
+        timeoutSeconds: config.timeoutSeconds,
+        promptRetries: config.promptRetries,
+      };
+      // Route effortful calls through a fresh per-transcript session so each harness's
+      // invocation-scoped overlay or safe fallback is applied; otherwise one-shot is cheaper.
+      return runModelCall(call, pick, {
+        sessionName: () => `backpass-analysis-${process.pid}-${slot}-${++callCounter}`,
+      });
+    });
+    for (const note of result.notes || []) noteOnce(note);
+
+    const parsed = extractJson(result.text);
+    if (!parsed) {
+      throw new Error("analysis returned no parseable JSON");
+    }
+
+    return {
+      status: "ok",
+      evidence: sanitizeEvidence(parsed, memoryFile, distilled.trace),
+      usage: usageRecord(ranWith, result),
+      distilled,
+    };
+  } catch (err) {
+    // Marks that this transcript reached the model-call attempt, regardless of how it
+    // failed, so callers can tell it apart from a failure that never got this far (#203).
+    err.modelCallAttempted = true;
+    throw err;
+  } finally {
+    if (rawFile) releaseRawFile(rawFile);
   }
-
-  return {
-    status: "ok",
-    evidence: sanitizeEvidence(parsed, memoryFile, distilled.trace),
-    usage: usageRecord(ranWith, result),
-    distilled,
-  };
 }
 
 /**
  * Bounded-concurrency worker pool - the design's `--jobs N` fan-out.
  * The worker also receives its runner slot so the progress view can show one
  * lane per job.
+ *
+ * A worker error is fatal to the run (per-transcript failures never reach here), so the
+ * first one stops the pool from handing out more items: without that, the other runners
+ * kept taking transcripts and making model calls after the run had already reported the
+ * failure. Calls already in flight finish and keep their results; the first error is
+ * rethrown once every runner has stopped, so nothing is still running when it surfaces.
  */
 async function pool(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
+  /** @type {{ err: unknown } | null} */
+  let failure = null;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async (_, slot) => {
-    for (;;) {
+    while (!failure) {
       const index = cursor;
       cursor += 1;
       if (index >= items.length) return;
-      results[index] = await worker(items[index], index, slot);
+      try {
+        results[index] = await worker(items[index], index, slot);
+      } catch (err) {
+        failure ??= { err };
+        return;
+      }
     }
   });
   await Promise.all(runners);
+  if (failure) throw failure.err;
   return results;
 }
 
@@ -278,6 +415,10 @@ export async function analyzeTranscripts({
     harness: transcript.harness,
     id: transcript.id,
     identity: transcriptIdentity(transcript),
+    parentSessionId: transcript.parentSessionId || null,
+    corroborationIdentity: corroborationIdentityOf(transcript),
+    corroborationNativeId: transcript.corroborationNativeId || null,
+    corroborationStartedAt: transcript.corroborationStartedAt ?? null,
     path: transcript.path,
     mtimeMs: transcript.mtimeMs,
     bytes: transcript.bytes,
@@ -360,7 +501,9 @@ export async function analyzeTranscripts({
 
   let done = 0;
   const evidenceTotals = { positive: 0, negative: 0, gaps: 0 };
-  await pool(pending, config.jobs, async (transcript, _index, slot) => {
+  const analyzePending = async (transcript, _index, slot) => {
+    /** @type {"ok" | "skipped" | "failed" | "failed-attempted"} */
+    let outcome;
     const base = {
       transcript: transcriptMetadata(transcript),
       memoryHash,
@@ -377,6 +520,7 @@ export async function analyzeTranscripts({
       phase: "distill",
     });
 
+    let modelCallMade = false;
     try {
       const result = await analyzeOne({
         transcript,
@@ -389,18 +533,21 @@ export async function analyzeTranscripts({
         skillIndex,
         alsoLoaded,
       });
+      modelCallMade = result.status !== "skipped";
       if (result.status === "skipped") {
-        summary.skipped += 1;
         state.writeEvidence(transcript, { ...base, status: "skipped", reason: result.reason });
+        outcome = "skipped";
+        summary.skipped += 1;
       } else {
-        summary.analyzed += 1;
-        summary.usage.push(result.usage);
         state.writeEvidence(transcript, {
           ...base,
           status: "ok",
           stats: result.distilled.stats,
           ...result.evidence,
         });
+        outcome = "ok";
+        summary.analyzed += 1;
+        summary.usage.push(result.usage);
         evidenceTotals.positive += result.evidence.positive.length;
         evidenceTotals.negative += result.evidence.negative.length;
         evidenceTotals.gaps += result.evidence.gaps.length;
@@ -413,6 +560,7 @@ export async function analyzeTranscripts({
       summary.failed += 1;
       warn(`${transcript.harness} ${transcriptLabel(transcript)}: ${err.message}`);
       state.writeEvidence(transcript, { ...base, status: "failed", error: err.message });
+      outcome = modelCallMade || err.modelCallAttempted ? "failed-attempted" : "failed";
     } finally {
       done += 1;
       emitProgress("analyze:tick", {
@@ -426,7 +574,27 @@ export async function analyzeTranscripts({
         info(`${color.dim(`  ${done}/${pending.length} analyzed`)}`);
       }
     }
-  });
+    return outcome;
+  };
+
+  // Claude refreshes a due OAuth token under a lock its owner must keep touching until the
+  // refresh ends. Each call here starts with a short-lived `sessions new` helper, so at
+  // jobs > 1 the first wave of helpers can abandon that lock and every session then fails
+  // (#203). Run transcripts one at a time until one has made a model call, so a due
+  // refresh finishes inside a single long-lived process before the fan-out. A skipped
+  // trivial session made no call, so it does not count; nor does a failure that never
+  // reached the model call (e.g. a corrupted transcript failing to read or distill).
+  // Not a retry: nothing re-runs.
+  let queue = pending;
+  if (pick.agent === "claude" && config.jobs > 1) {
+    let called = false;
+    while (!called && queue.length) {
+      const outcome = await analyzePending(queue[0], 0, 0);
+      called = outcome === "ok" || outcome === "failed-attempted";
+      queue = queue.slice(1);
+    }
+  }
+  await pool(queue, config.jobs, analyzePending);
 
   if (summary.quotesNotInTrace) {
     warn(
